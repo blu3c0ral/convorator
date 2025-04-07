@@ -1,15 +1,25 @@
 from dataclasses import dataclass, field
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Protocol, Union
 
 from convorator.client.llm_client import LLMInterface
 
+from convorator.conversations.prompts import PromptBuilderFunctions
 from convorator.utils.logger import setup_logger
+
+
+# Define a protocol for the logger if needed, or use logging.Logger
+class LoggerProtocol(Protocol):
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None: ...
 
 
 @dataclass
 class SolutionLLMGroup:
-    """Specifies the LLM clients for different roles in the process."""
+    """Groups the different LLMs required for the solution improvement process."""
 
     primary_llm: LLMInterface
     debater_llm: LLMInterface
@@ -20,40 +30,40 @@ class SolutionLLMGroup:
 # --- Core Process Configuration ---
 @dataclass
 class OrchestratorConfig:
-    """Main configuration for the solution improvement process."""
+    """Configuration for the SolutionImprovementOrchestrator."""
 
-    # --- LLMs ---
+    # Core Components
     llm_group: SolutionLLMGroup
+    topic: str  # Added topic
 
-    # --- Process Control & Task Definition ---
-    debate_iterations: int = 3
+    # --- Inputs moved to Orchestrator.__init__ ---
+    # initial_solution: str = ""
+    # requirements: str = ""
+    # assessment_criteria: str = ""
+
+    # --- Orchestration Parameters ---
+    debate_iterations: int = 2
     improvement_iterations: int = 3
-    expect_json_output: bool = True
-    solution_schema: Optional[Dict[str, Any]] = None
-    topic: Optional[str] = None
-    # Task specifics often provided at runtime or via a separate object
-    initial_solution: str = ""
-    requirements: str = ""
-    assessment_criteria: str = ""
+    expect_json_output: bool = True  # Expect final solution to be JSON by default
+    solution_schema: Optional[Dict[str, Any]] = None  # Optional JSON schema for validation
 
-    # --- Prompt Builders ---
-    # Users configure this object with desired functions
+    # --- Customization ---
+    # Optional logger, defaults to standard logging if not provided
+    logger: LoggerProtocol = field(default_factory=lambda: logging.getLogger(__name__))
+    # Prompt builders - uses defaults if not provided
     prompt_builders: PromptBuilderFunctions = field(default_factory=PromptBuilderFunctions)
-
-    # --- Logging ---
-    logger: logging.Logger = field(default_factory=setup_logger)
-
-    # Debate context (moved here from ModeratedConversationConfig)
-    debate_context: Optional[str] = None
-
-    # Potential place for moderator_instructions if needed by default builder funcs
+    # Optional: Specific instructions for the moderator beyond the basic role
     moderator_instructions: Optional[str] = None
+    # Optional: Additional context for the entire debate/process
+    debate_context: Optional[str] = None
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        if self.debate_iterations < 1:
+            raise ValueError("debate_iterations must be at least 1.")
+        if self.improvement_iterations < 1:
+            raise ValueError("improvement_iterations must be at least 1.")
         if not isinstance(self.llm_group, SolutionLLMGroup):
-            raise TypeError("llm_group must be an instance of SolutionLLMGroup")
-        if not isinstance(self.prompt_builders, PromptBuilderFunctions):
-            raise TypeError("prompt_builders must be an instance of PromptBuilderFunctions")
-        # Add more validation checks as needed
-        self.logger.info("OrchestratorConfig initialized.")
+            raise TypeError("llm_group must be an instance of SolutionLLMGroup.")
+        # Add more validation as needed
+        self.logger.info("OrchestratorConfig initialized and validated.")

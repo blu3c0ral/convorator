@@ -109,7 +109,9 @@ import json
 from typing import Callable, Dict, List, Optional, Union, Any
 
 import jsonschema
-from convorator.conversations.conversation_setup import (
+
+# Import exceptions from the new central location
+from convorator.exceptions import (
     LLMOrchestrationError,
     LLMResponseError,
     MaxIterationsExceededError,
@@ -123,8 +125,11 @@ import convorator.utils.logger as setup_logger
 # Configure logging
 logger = setup_logger.setup_logger(__name__)
 
-# Import the new config class
+# Import the config class
 from convorator.conversations.configurations import OrchestratorConfig
+
+# Import the conversation state class
+from convorator.conversations.state import MultiAgentConversation
 
 # Import prompt builders and the container class
 from convorator.conversations.prompts import (
@@ -141,107 +146,11 @@ from convorator.conversations.prompts import (
 )
 
 
-class MultiAgentConversation:
-    """
-    Maintains the state of a conversation with an LLM.
-    """
-
-    def __init__(self, system_message: Optional[str] = None):
-        """
-        Initialize a conversation.
-
-        Args:
-            system_message (Optional[str]): Initial system message. Defaults to None.
-        """
-        self.messages: List[Message] = []
-        if system_message:
-            # Use the proper method to ensure correct placement/replacement
-            self.set_system_message(system_message)
-
-    def set_system_message(self, content: str) -> None:
-        """
-        Set or update the system message for the conversation.
-
-        If a system message exists, it's updated. Otherwise, it's inserted at the beginning.
-
-        Args:
-            content (str): The system message content.
-        """
-        # Check if a system message already exists and update it
-        for i, message in enumerate(self.messages):
-            if message.role == "system":
-                self.messages[i] = Message("system", content)
-                logger.debug("Updated existing system message.")
-                return
-
-        # Otherwise insert a new system message at the beginning
-        self.messages.insert(0, Message("system", content))
-        logger.debug("Inserted new system message.")
-
-    def add_message(self, role: str, content: str) -> None:
-        """
-        Add a message to the conversation.
-
-        Args:
-            role (str): The role of the message sender.
-            content (str): The message content.
-        """
-        self.messages.append(Message(role=role, content=content))
-        logger.debug(
-            f"Added a message to the conversation with role: {role}, content: {content[:100]}...",
-        )
-
-    def get_messages(self) -> List[Dict[str, str]]:
-        """
-        Get all messages in dictionary format for API requests.
-
-        Returns:
-            List[Dict[str, str]]: List of message dictionaries.
-        """
-        return [message.to_dict() for message in self.messages]
-
-    def clear_conversation(self, clear_system_message: bool = False) -> None:
-        """
-        Clear all messages except the system message (if one exists).
-        """
-        system_message_content = None
-        if clear_system_message:
-            for message in self.messages:
-                if message.role == "system":
-                    system_message_content = message.content
-                    break
-
-        self.messages = []
-        if system_message_content is not None:
-            # Re-add the system message using the proper method
-            self.set_system_message(system_message_content)
-        logger.info(
-            f"Conversation cleared (system message {'preserved' if not clear_system_message else 'cleared'} if existed)."
-        )
-
-    def is_system_message_set(self) -> bool:
-        """
-        Check if a system message has been set in the conversation.
-
-        Returns:
-            bool: True if a system message exists, False otherwise.
-        """
-        return any(message.role == "system" for message in self.messages)
-
-    def switch_traditional_conversation_roles(self) -> None:
-        """
-        Switch the roles of 'user' and 'assistant' messages. System messages remain unchanged.
-        """
-        for message in self.messages:
-            if message.role == "user":
-                message.role = "assistant"
-            elif message.role == "assistant":
-                message.role = "user"
-        logger.debug("Switched user/assistant roles in conversation.")
-
-
 def improve_solution_with_moderation(
     config: OrchestratorConfig,  # Changed type hint
+    initial_solution: Union[Dict, str],
+    requirements: str,
+    assessment_criteria: str,
 ) -> Union[Dict, str]:
     """
     Orchestrates the moderated solution improvement process using a configuration object.
@@ -252,6 +161,9 @@ def improve_solution_with_moderation(
 
     Args:
         config: An OrchestratorConfig instance containing all necessary configurations.
+        initial_solution: The starting solution (string or dictionary).
+        requirements: The requirements the solution must meet.
+        assessment_criteria: Criteria for evaluating the solution during debate.
 
     Returns:
         The final improved solution dictionary or string.
@@ -260,7 +172,12 @@ def improve_solution_with_moderation(
         Exceptions propagated from the `SolutionImprovementOrchestrator.run()` method.
     """
     try:
-        orchestrator = SolutionImprovementOrchestrator(config)
+        orchestrator = SolutionImprovementOrchestrator(
+            config=config,
+            initial_solution=initial_solution,
+            requirements=requirements,
+            assessment_criteria=assessment_criteria,
+        )
         return orchestrator.run()
     except Exception as e:
         # Log top-level failure if desired, but primarily rely on orchestrator logging
@@ -279,12 +196,21 @@ class SolutionImprovementOrchestrator:
     state, configuration, and step-by-step execution of the workflow.
     """
 
-    def __init__(self, config: OrchestratorConfig):  # Changed type hint
+    def __init__(
+        self,
+        config: OrchestratorConfig,
+        initial_solution: Union[Dict, str],
+        requirements: str,
+        assessment_criteria: str,
+    ):  # Changed type hint
         """
-        Initializes the orchestrator with the provided configuration.
+        Initializes the orchestrator with the provided configuration and task specifics.
 
         Args:
-            config: The OrchestratorConfig object containing all settings for the workflow.
+            config: The OrchestratorConfig object containing general settings.
+            initial_solution: The starting solution (string or dictionary).
+            requirements: The requirements the solution must meet.
+            assessment_criteria: Criteria for evaluating the solution during debate.
         """
         if not isinstance(config, OrchestratorConfig):
             raise TypeError("config must be an instance of OrchestratorConfig.")
@@ -298,6 +224,11 @@ class SolutionImprovementOrchestrator:
         self.improvement_iterations = config.improvement_iterations
         self.moderator_instructions = config.moderator_instructions
         self.debate_context = config.debate_context  # Added field
+
+        # Store task-specific inputs directly
+        self.initial_solution = initial_solution
+        self.requirements = requirements
+        self.assessment_criteria = assessment_criteria
 
         # Extract LLMs
         self.primary_llm = self.llm_group.primary_llm
@@ -376,9 +307,9 @@ class SolutionImprovementOrchestrator:
             logger=self.logger,
             llm_group=self.llm_group,
             solution_schema=self.config.solution_schema,
-            initial_solution=self.config.initial_solution,
-            requirements=self.config.requirements,
-            assessment_criteria=self.config.assessment_criteria,
+            initial_solution=self.initial_solution,
+            requirements=self.requirements,
+            assessment_criteria=self.assessment_criteria,
             moderator_instructions=self.moderator_instructions,  # Use attribute set in __init__
             debate_context=self.debate_context,  # Use attribute set in __init__
             primary_role_name=self.primary_name,

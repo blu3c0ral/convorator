@@ -1,10 +1,10 @@
 # prompts.py
 from dataclasses import dataclass, field
 import logging
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Optional
 
-from convorator.conversations.conversation_orchestrator import MultiAgentConversation
-from convorator.conversations.conversation_setup import SolutionLLMGroup
+from convorator.conversations.state import MultiAgentConversation
+from convorator.conversations.configurations import SolutionLLMGroup
 
 
 @dataclass
@@ -65,9 +65,9 @@ def _get_nth_last_message_content_by_role(
     return None
 
 
-def default_moderator_context_builder(inputs: PromptBuilderInputs) -> str:
+def default_build_moderator_context(inputs: PromptBuilderInputs) -> str:
     """
-    Revised default builder for the Moderator's context prompt using PromptBuilderInputs.
+    Default builder for the Moderator's context prompt using PromptBuilderInputs.
     Includes the most recent exchange by retrieving messages from history.
     """
     if not inputs.conversation_history:
@@ -113,7 +113,7 @@ def default_moderator_context_builder(inputs: PromptBuilderInputs) -> str:
     return moderator_full_context
 
 
-def default_debater_prompt_with_feedback(inputs: PromptBuilderInputs) -> str:
+def default_build_debater_prompt(inputs: PromptBuilderInputs) -> str:
     """
     Default prompt builder for the Debater LLM turn AFTER moderation, using PromptBuilderInputs.
     Retrieves necessary context from conversation history.
@@ -156,7 +156,7 @@ def default_debater_prompt_with_feedback(inputs: PromptBuilderInputs) -> str:
     return prompt
 
 
-def default_primary_prompt_with_feedback(inputs: PromptBuilderInputs) -> str:
+def default_build_primary_prompt(inputs: PromptBuilderInputs) -> str:
     """
     Default prompt builder for the Primary LLM turn using PromptBuilderInputs.
     Includes optional feedback from the previous round's Moderator as context.
@@ -240,31 +240,50 @@ def default_build_summary_prompt(inputs: PromptBuilderInputs) -> str:
     return prompt
 
 
-def default_build_solution_improvement_prompt(inputs: PromptBuilderInputs) -> str:
+def default_build_improvement_prompt(inputs: PromptBuilderInputs) -> str:
     """Builds the prompt for generating an improved solution using PromptBuilderInputs."""
     if not inputs.moderator_summary:
         inputs.logger.warning("Building solution improvement prompt without moderator summary.")
 
-    return (
+    prompt = (
         f"Original solution:\n{inputs.initial_solution or '[Not Provided]'}\n\n"
         f"Moderator's summary and instructions:\n{inputs.moderator_summary or '[Not Provided]'}\n\n"
-        "Using these insights, provide an improved solution. Ensure the output strictly matches the format and structure of the original solution."
+        "Please generate an improved solution based *only* on the moderator's summary and instructions. "
+        f"Adhere strictly to the requirements and assessment criteria mentioned earlier. "
     )
+    if inputs.expect_json_output:
+        prompt += "Format your response as a valid JSON object."
+        if inputs.solution_schema:
+            prompt += f" matching this schema:\n```json\n{json.dumps(inputs.solution_schema, indent=2)}\n```"
+        else:
+            prompt += " Use appropriate keys and values based on the context."
+    else:
+        prompt += "Format your response as a plain text string."
+
+    return prompt
 
 
-def default_fix_prompt_builder(inputs: PromptBuilderInputs) -> str:
-    """
-    Default fix prompt template using PromptBuilderInputs.
-    """
-    if not all([inputs.requirements, inputs.response_to_fix, inputs.errors_to_fix]):
-        inputs.logger.warning("Building fix prompt with missing requirements, response, or errors.")
+def default_build_fix_prompt(inputs: PromptBuilderInputs) -> str:
+    """Builds a prompt to ask the LLM to fix its previous response."""
+    if not inputs.response_to_fix or not inputs.errors_to_fix:
+        inputs.logger.error("Fix prompt builder called without response or errors to fix.")
+        return "[Error: Missing input for fix prompt]"
 
-    return (
-        f"Requirements:\n{inputs.requirements or '[Not Provided]'}\n\n"
-        f"Response with errors:\n{inputs.response_to_fix or '[Not Provided]'}\n\n"
-        f"Identified Errors:\n{inputs.errors_to_fix or '[Not Provided]'}\n\n"
-        "Please fix the above response to meet the requirements and address the identified errors. Output only the corrected response."
+    fix_request = (
+        f"The following response you provided resulted in errors:\n---\n{inputs.response_to_fix}\n---\n"
+        f"The errors encountered were:\n{inputs.errors_to_fix}\n\n"
+        f"Please regenerate the response, correcting these errors. "
+        f"Ensure the corrected response still meets the original requirements."
     )
+    # Add format instructions again for clarity
+    if inputs.expect_json_output:
+        fix_request += " Format your corrected response as a valid JSON object."
+        if inputs.solution_schema:
+            fix_request += f" matching the schema provided previously."
+    else:
+        fix_request += " Format your corrected response as a plain text string."
+
+    return fix_request
 
 
 def default_build_debate_user_prompt(inputs: PromptBuilderInputs) -> str:
@@ -314,23 +333,15 @@ class PromptBuilderFunctions:
     build_debate_user_prompt: Callable[[PromptBuilderInputs], str] = (
         default_build_debate_user_prompt
     )
-    build_moderator_context: Callable[[PromptBuilderInputs], str] = (
-        default_moderator_context_builder
-    )
+    build_moderator_context: Callable[[PromptBuilderInputs], str] = default_build_moderator_context
     # Added builder for the default moderator instructions
     build_moderator_instructions: Callable[[PromptBuilderInputs], str] = (
         default_build_moderator_instructions
     )
-    build_primary_prompt: Callable[[PromptBuilderInputs], str] = (
-        default_primary_prompt_with_feedback  # Renamed original function
-    )
-    build_debater_prompt: Callable[[PromptBuilderInputs], str] = (
-        default_debater_prompt_with_feedback  # Renamed original function
-    )
-    build_summary_prompt: Callable[[PromptBuilderInputs], str] = (
-        default_build_summary_prompt  # Renamed original function
-    )
+    build_primary_prompt: Callable[[PromptBuilderInputs], str] = default_build_primary_prompt
+    build_debater_prompt: Callable[[PromptBuilderInputs], str] = default_build_debater_prompt
+    build_summary_prompt: Callable[[PromptBuilderInputs], str] = default_build_summary_prompt
     build_improvement_prompt: Callable[[PromptBuilderInputs], str] = (
-        default_build_solution_improvement_prompt  # Renamed original function
+        default_build_improvement_prompt
     )
-    build_fix_prompt: Callable[[PromptBuilderInputs], str] = default_fix_prompt_builder
+    build_fix_prompt: Callable[[PromptBuilderInputs], str] = default_build_fix_prompt

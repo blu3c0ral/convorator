@@ -50,1258 +50,1512 @@ Version:
 TODO: Provider API versioning and compatibility checks
 """
 
-from datetime import datetime, timezone
-import functools
-import json
 import os
-import time
-from typing import Dict, List, Any, Optional
-import uuid
-import requests
+import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
+
+# Assuming standard project structure where 'convorator' is a top-level package
+try:
+    from convorator.utils.logger import setup_logger
+    from convorator.exceptions import (
+        LLMClientError,
+        LLMConfigurationError,
+        LLMResponseError,
+    )
+except ImportError:
+    # Fallback for running the script directly or if structure differs
+    import logging
+
+    setup_logger = lambda name: logging.getLogger(name)  # Basic logger fallback
+
+    # Define basic exceptions if import fails (not ideal for production)
+    class LLMClientError(Exception):
+        pass
+
+    class LLMConfigurationError(LLMClientError):
+        pass
+
+    class LLMResponseError(Exception):
+        pass
+
+    logging.warning(
+        "Could not import from convorator package. Using basic logging and exception definitions."
+    )
 
 
-import convorator.utils.logger as setup_logger
+logger = setup_logger("llm_client")  # Use a specific logger name
 
-# Configure logging
-logger = setup_logger.setup_logger("llm_client")
+# Constants
+DEFAULT_MAX_TOKENS = 4096
+DEFAULT_TEMPERATURE = 0.7
 
-
-class LLMError(Exception):
-    """Base exception for all LLM-related errors."""
-
-    pass
+# --- Helper Classes (Message, Conversation) ---
 
 
-class AuthenticationError(LLMError):
-    """Raised when authentication fails (missing or invalid API key)."""
-
-    pass
-
-
-class APIError(LLMError):
-    """Raised when the LLM API returns an error response."""
-
-    def __init__(self, message, provider, status_code=None, response_text=None, request_info=None):
-        self.provider = provider
-        self.status_code = status_code
-        self.response_text = response_text
-        self.request_info = request_info  # redacted payload
-        super().__init__(message)
-
-
-class RateLimitError(APIError):
-    """Raised when rate limits are exceeded."""
-
-    pass
-
-
-class ConnectionError(LLMError):
-    """Raised for network connectivity issues."""
-
-    pass
-
-
-class ProviderError(LLMError):
-    """Raised for provider-specific errors (e.g., parsing issues)."""
-
-    def __init__(self, provider, original_error):
-        self.provider = provider
-        self.original_error = original_error
-        message = f"Error from {provider} provider: {str(original_error)}"
-        super().__init__(message)
-
-
-# ---------------------------
-# Centralized Exception Handler
-# ---------------------------
-def handle_provider_exceptions(provider_name: str):
-    """
-    Decorator that standardizes exception handling across LLM providers.
-
-    This decorator wraps provider API calls to ensure consistent error handling
-    by transforming provider-specific exceptions into the application's
-    exception hierarchy. It also adds logging with request tracking.
-
-    Args:
-        provider_name (str): Name of the LLM provider being used (e.g., "OpenAI", "Claude")
-
-    Returns:
-        callable: Decorated function with standardized exception handling
-
-    Raises:
-        ConnectionError: For network timeouts and connectivity issues
-        AuthenticationError: For authentication and authorization failures (401, 403)
-        RateLimitError: When API rate limits are exceeded (429)
-        APIError: For other API errors with context about the failure
-        ProviderError: For unexpected errors from the provider (should be rare if specific errors are caught)
-    """
-
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            request_id = uuid.uuid4().hex
-            try:
-                logger.info(
-                    f"Sending request to {provider_name}",
-                    extra={
-                        "provider": provider_name,
-                        "request_id": request_id,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-                return func(*args, **kwargs)
-            except requests.exceptions.Timeout as e:
-                logger.error(f"{provider_name} API request timed out.", exc_info=True)
-                raise ConnectionError(f"{provider_name} API request timed out.") from e
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"Network connection issue with {provider_name} API.", exc_info=True)
-                raise ConnectionError(f"Network connection issue with {provider_name} API.") from e
-            except requests.exceptions.HTTPError as e:
-                status_code = e.response.status_code
-                response_text = e.response.text
-                logger.error(
-                    f"{provider_name} API returned HTTP {status_code}: {response_text}",
-                    exc_info=True,
-                )
-                if status_code in (401, 403):
-                    raise AuthenticationError(f"{provider_name} authentication failed.") from e
-                elif status_code == 429:
-                    raise RateLimitError(
-                        "Rate limit exceeded",
-                        provider=provider_name,
-                        status_code=429,
-                        response_text=response_text,
-                    ) from e
-                else:
-                    raise APIError(
-                        f"{provider_name} API error",
-                        provider=provider_name,
-                        status_code=status_code,
-                        response_text=response_text,
-                    ) from e
-            # Catch specific ProviderErrors raised internally first
-            except ProviderError as e:
-                logger.error(
-                    f"Provider-specific error during {provider_name} call: {e}", exc_info=True
-                )
-                raise  # Re-raise ProviderError as is
-            # FIX: Catch other unexpected exceptions last
-            except Exception as e:
-                logger.exception(
-                    f"Unexpected error during {provider_name} API call.", exc_info=True
-                )
-                # Wrap unexpected errors in ProviderError for consistency
-                raise ProviderError(provider_name, e) from e
-
-        return wrapper
-
-    return decorator
-
-
-# ---------------------------
-# Retry Mechanism
-# ---------------------------
-def retry(max_attempts=3, backoff_factor=1, retry_statuses=(429, 500, 502, 503, 504)):
-    """
-    Decorator that implements exponential backoff retry logic for API calls.
-
-    This decorator automatically retries failed API calls that result in
-    transient errors such as rate limits or server errors. Each retry
-    uses exponential backoff to increase the delay between attempts.
-
-    Args:
-        max_attempts (int): Maximum number of retry attempts (default: 3)
-        backoff_factor (int): Base factor for exponential backoff calculation (default: 1)
-        retry_statuses (tuple): HTTP status codes that should trigger a retry (default: 429, 500, 502, 503, 504)
-
-    Returns:
-        callable: Decorated function with retry capability
-
-    Raises:
-        ConnectionError: When maximum retry attempts are exceeded for network errors or retryable API errors.
-        APIError: For non-retriable API errors.
-        AuthenticationError: For authentication errors (not retried).
-        ProviderError: For provider-specific errors (not retried by default).
-        Other exceptions: Original exceptions for non-retriable errors.
-
-    Note:
-        The backoff delay is calculated as: backoff_factor * (2 ** attempt_number)
-    """
-
-    def decorator_retry(func):
-        @functools.wraps(func)
-        def wrapper_retry(*args, **kwargs):
-            attempts = 0
-            last_exception = None
-            while attempts < max_attempts:
-                try:
-                    return func(*args, **kwargs)
-                # Catch specific retryable errors first
-                except (RateLimitError, APIError) as e:
-                    last_exception = e
-                    # Check if it's an APIError with a retryable status code
-                    if isinstance(e, APIError) and e.status_code in retry_statuses:
-                        attempts += 1
-                        if attempts >= max_attempts:
-                            logger.error(
-                                f"Max retry attempts ({max_attempts}) reached for API error."
-                            )
-                            break  # Exit loop to raise ConnectionError below
-                        sleep_time = backoff_factor * (2 ** (attempts - 1))
-                        logger.warning(
-                            f"Retrying attempt {attempts}/{max_attempts} after {sleep_time:.2f}s due to API error: {e}"
-                        )
-                        time.sleep(sleep_time)
-                    else:
-                        # Non-retryable APIError or RateLimitError (if 429 not in retry_statuses, though unlikely)
-                        raise
-                except (
-                    ConnectionError
-                ) as e:  # Catch ConnectionError raised by handle_provider_exceptions
-                    last_exception = e
-                    attempts += 1
-                    if attempts >= max_attempts:
-                        logger.error(
-                            f"Max retry attempts ({max_attempts}) reached for connection error."
-                        )
-                        break  # Exit loop to raise ConnectionError below
-                    sleep_time = backoff_factor * (2 ** (attempts - 1))
-                    logger.warning(
-                        f"Retrying attempt {attempts}/{max_attempts} after {sleep_time:.2f}s due to connection error: {e}"
-                    )
-                    time.sleep(sleep_time)
-                # Let AuthenticationError and non-retryable ProviderError propagate immediately
-                except (AuthenticationError, ProviderError) as e:
-                    raise
-                # Catch other unexpected exceptions (should be rare if handle_provider_exceptions is robust)
-                except Exception as e:
-                    logger.exception("Caught unexpected exception in retry loop.")
-                    raise  # Re-raise unexpected exceptions immediately
-
-            # If loop finished due to max attempts, raise ConnectionError
-            raise ConnectionError(
-                f"Maximum retry attempts ({max_attempts}) exceeded."
-            ) from last_exception
-
-        return wrapper_retry
-
-    return decorator_retry
-
-
+@dataclass
 class Message:
-    """
-    Represent a message in a conversation.
-    """
+    """Represents a single message in a conversation."""
 
-    def __init__(self, role: str, content: str):
-        """
-        Initialize a message.
-
-        Args:
-            role: The role of the message sender
-            content: The content of the message
-
-        Raises:
-            TypeError: If role or content are not strings.
-        """
-        if not isinstance(role, str) or not isinstance(content, str):
-            raise TypeError("Role and content must be strings")
-        self.role = role
-        self.content = content
+    role: str  # Typically 'system', 'user', or 'assistant'/'model'
+    content: str
 
     def to_dict(self) -> Dict[str, str]:
-        """
-        Convert the message to a dictionary format.
-
-        Returns:
-            Dict[str, str]: Dictionary with 'role' and 'content' keys.
-        """
+        """Converts the message to a dictionary."""
         return {"role": self.role, "content": self.content}
 
 
-class ProviderMessage(Message):
-    """
-    Represents a single message in an LLM conversation.
-    """
-
-    def __init__(self, role: str, content: str):
-        """
-        Initialize a message.
-
-        Args:
-            role: The role of the message sender ('system', 'user', or 'assistant')
-            content: The content of the message
-
-        Raises:
-            TypeError: If role or content are not strings.
-            ValueError: If role is not one of 'system', 'user', or 'assistant'.
-        """
-        if not isinstance(role, str) or not isinstance(content, str):
-            raise TypeError("Role and content must be strings")
-        if role not in ["system", "user", "assistant"]:
-            raise ValueError("Role must be 'system', 'user', or 'assistant'")
-        super().__init__(role, content)
-
-
+@dataclass
 class Conversation:
-    """
-    Maintains the state of a conversation with an LLM.
-    """
+    """Manages the conversation history for an LLM interaction."""
 
-    def __init__(self, system_message: Optional[str] = None):
-        """
-        Initialize a conversation.
+    messages: List[Message] = field(default_factory=list)
+    system_message: Optional[str] = None  # Stores the intended system message content
 
-        Args:
-            system_message (Optional[str]): Initial system message. Defaults to None.
-        """
-        self.messages: List[ProviderMessage] = []
-        if system_message:
-            # Use the proper method to ensure correct placement/replacement
-            self.set_system_message(system_message)
+    def __post_init__(self):
+        """Ensures the system message is correctly placed if provided."""
+        if self.system_message and (not self.messages or self.messages[0].role != "system"):
+            # Insert system message at the beginning if it's not already there
+            self.messages.insert(0, Message(role="system", content=self.system_message))
+        elif not self.system_message and self.messages and self.messages[0].role == "system":
+            # If system_message is None but history starts with one, update internal state
+            self.system_message = self.messages[0].content
 
-    def set_system_message(self, content: str) -> None:
-        """
-        Set or update the system message for the conversation.
+    def add_message(self, role: str, content: str):
+        """Adds a message to the conversation, handling system message updates."""
+        role = role.lower()  # Normalize role
 
-        If a system message exists, it's updated. Otherwise, it's inserted at the beginning.
+        if role == "system":
+            self.system_message = content  # Update the stored system message content
+            # Check if a system message already exists in the list
+            for i, msg in enumerate(self.messages):
+                if msg.role == "system":
+                    if msg.content != content:
+                        logger.debug("Updating existing system message in history.")
+                        self.messages[i] = Message(role="system", content=content)
+                    return  # Found and potentially updated
+            # If no system message exists, add it to the beginning
+            logger.debug("Inserting new system message at the beginning of history.")
+            self.messages.insert(0, Message(role="system", content=content))
+        else:
+            # Check for consecutive non-system messages with the same role
+            last_non_system_role = None
+            if self.messages:
+                # Find the role of the last non-system message
+                for msg in reversed(self.messages):
+                    if msg.role != "system":
+                        last_non_system_role = msg.role
+                        break
 
-        Args:
-            content (str): The system message content.
-        """
-        # Check if a system message already exists and update it
-        for i, message in enumerate(self.messages):
-            if message.role == "system":
-                self.messages[i] = ProviderMessage("system", content)
-                logger.debug("Updated existing system message.")
-                return
+            if last_non_system_role == role:
+                logger.warning(
+                    f"Adding consecutive messages with the same role '{role}'. This might cause issues with some LLM APIs (e.g., Anthropic, Gemini)."
+                )
+            elif role not in ["user", "assistant", "model"]:  # 'model' is used by Gemini
+                logger.warning(
+                    f"Adding message with non-standard role '{role}'. Ensure the target API supports this."
+                )
 
-        # Otherwise insert a new system message at the beginning
-        self.messages.insert(0, ProviderMessage("system", content))
-        logger.debug("Inserted new system message.")
+            self.messages.append(Message(role=role, content=content))
 
-    def add_user_message(self, content: str) -> None:
-        """
-        Add a user message to the conversation history.
+    def add_user_message(self, content: str):
+        """Convenience method to add a user message."""
+        self.add_message("user", content)
 
-        Args:
-            content (str): The user message content.
-        """
-        self.messages.append(ProviderMessage("user", content))
-        logger.debug("Added user message.")
-
-    def add_assistant_message(self, content: str) -> None:
-        """
-        Add an assistant message to the conversation history.
-
-        Args:
-            content (str): The assistant message content.
-        """
-        self.messages.append(ProviderMessage("assistant", content))
-        logger.debug("Added assistant message.")
+    def add_assistant_message(self, content: str):
+        """Convenience method to add an assistant/model message."""
+        # Use 'assistant' as the generic internal role
+        self.add_message("assistant", content)
 
     def get_messages(self) -> List[Dict[str, str]]:
-        """
-        Get all messages in dictionary format for API requests.
+        """Returns the conversation history as a list of dictionaries."""
+        return [msg.to_dict() for msg in self.messages]
 
-        Returns:
-            List[Dict[str, str]]: List of message dictionaries.
-        """
-        return [message.to_dict() for message in self.messages]
-
-    def clear(self) -> None:
-        """
-        Clear all messages except the system message (if one exists).
-        """
-        system_message_content = None
-        for message in self.messages:
-            if message.role == "system":
-                system_message_content = message.content
-                break
-
-        self.messages = []
-        if system_message_content is not None:
-            # Re-add the system message using the proper method
-            self.set_system_message(system_message_content)
-        logger.info("Conversation cleared (system message preserved if existed).")
-
-    def is_system_message_set(self) -> bool:
-        """
-        Check if a system message has been set in the conversation.
-
-        Returns:
-            bool: True if a system message exists, False otherwise.
-        """
-        return any(message.role == "system" for message in self.messages)
-
-    def switch_conversation_roles(self) -> None:
-        """
-        Switch the roles of 'user' and 'assistant' messages. System messages remain unchanged.
-        """
-        for message in self.messages:
-            if message.role == "user":
-                message.role = "assistant"
-            elif message.role == "assistant":
-                message.role = "user"
-        logger.debug("Switched user/assistant roles in conversation.")
+    def clear(self, keep_system: bool = True):
+        """Clears the conversation history."""
+        if keep_system and self.system_message:
+            # Keep only the system message if it exists
+            self.messages = [Message(role="system", content=self.system_message)]
+        else:
+            # Clear everything
+            self.messages = []
+            self.system_message = None  # Also clear the stored system message content
+        logger.debug(
+            f"Conversation cleared (System message {'kept' if keep_system and self.system_message else 'removed'})."
+        )
 
 
-class LLMProvider(ABC):
+# --- LLM Interface Definition ---
+
+
+class LLMInterface(ABC):
     """
-    Abstract base class for LLM providers.
+    Abstract base class defining the interface for LLM clients.
+    Manages conversation state and provides a unified query method.
     """
 
-    def __init__(self, temperature: float = 0.5):
-        """
-        Initialize the abstract LLM provider.
-
-        Args:
-            temperature (float): Controls randomness (0.0 to 1.0). Defaults to 0.5.
-        """
-        # Clamp temperature during initialization
-        self._temperature = max(0.0, min(1.0, temperature))
-        if self._temperature != temperature:
-            logger.warning(f"Temperature {temperature} clamped to {self._temperature}.")
+    conversation: Conversation
+    _system_message: Optional[str]  # Stored desired system message
+    _role_name: Optional[str]  # Optional name for the assistant role
 
     @abstractmethod
-    def query(self, prompt: str, conversation: Optional[Conversation] = None) -> str:
+    def _call_api(self, messages: List[Dict[str, str]]) -> str:
         """
-        Send a query to the LLM and return the response. Must be implemented by subclasses.
-
-        Args:
-            prompt (str): The prompt to send.
-            conversation (Optional[Conversation]): Conversation context. Defaults to None.
-
-        Returns:
-            str: Text response from the LLM.
-
-        Raises:
-            NotImplementedError: If the subclass does not implement this method.
-            AuthenticationError: If authentication fails.
-            RateLimitError: If rate limits are exceeded.
-            APIError: If the provider API returns an error.
-            ConnectionError: If there's a network issue.
-            ProviderError: For provider-specific parsing or unexpected errors.
+        Abstract method to handle the actual API call for the specific provider.
+        Must be implemented by subclasses. Should raise appropriate convorator exceptions
+        (LLMClientError, LLMConfigurationError, LLMResponseError) on failure.
         """
         pass
-
-
-class OpenAIProvider(LLMProvider):
-    """
-    Provider for OpenAI's API (GPT models).
-    """
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model: str = "gpt-4",
-        temperature: float = 0.5,
-    ):
-        """
-        Initialize the OpenAI provider.
-
-        Args:
-            api_key (Optional[str]): API key. Uses OPENAI_API_KEY env var if None.
-            model (str): Model identifier. Defaults to "gpt-4".
-            temperature (float): Controls randomness. Defaults to 0.5.
-
-        Raises:
-            AuthenticationError: If no API key is found.
-        """
-        super().__init__(temperature)
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.model = model
-        self.api_url = "https://api.openai.com/v1/chat/completions"
-
-        if not self.api_key:
-            logger.error(
-                "No OpenAI API key provided or found in environment variable OPENAI_API_KEY."
-            )
-            raise AuthenticationError("No OpenAI API key provided.")
-        logger.info(f"OpenAIProvider initialized with model: {self.model}")
-
-    @retry()  # Use default retry settings
-    @handle_provider_exceptions("OpenAI")
-    def query(self, prompt: str, conversation: Optional[Conversation] = None) -> str:
-        """
-        Send a query to OpenAI's API. See base class for Args and Raises.
-        """
-        # API key check is implicitly handled by handle_provider_exceptions via HTTPError 401/403
-        # but we ensure it exists during init.
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        # Prepare messages
-        current_messages: List[Dict[str, str]]
-        if conversation:
-            # Add the user's prompt *before* getting messages for the API call
-            conversation.add_user_message(prompt)
-            current_messages = conversation.get_messages()
-        else:
-            current_messages = [{"role": "user", "content": prompt}]
-
-        data = {
-            "model": self.model,
-            "messages": current_messages,
-            "temperature": self._temperature,
-        }
-        logger.debug(f"Sending request to OpenAI: {data}")
-
-        # Make the API call
-        response = requests.post(
-            self.api_url, headers=headers, json=data, timeout=30
-        )  # Standard timeout
-
-        # Let handle_provider_exceptions deal with HTTP errors (4xx, 5xx)
-        response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
-
-        # Process successful response (200 OK)
-        try:
-            response_data = response.json()
-            logger.debug(f"Received response from OpenAI: {response_data}")
-            # Safely access the content
-            content = response_data.get("choices", [{}])[0].get("message", {}).get("content")
-
-            if content is None:  # Check for None or missing content explicitly
-                logger.error(
-                    f"Received unexpected response structure or empty content from OpenAI: {response_data}"
-                )
-                raise ValueError("Received empty or malformed content from API")
-
-            # Add the assistant's response to the conversation *after* successful retrieval
-            if conversation:
-                conversation.add_assistant_message(content)
-
-            return content
-
-        # FIX: Catch only specific parsing/validation errors here
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
-            logger.error(
-                f"Error parsing OpenAI response: {response.text} | Error: {e}", exc_info=True
-            )
-            raise ProviderError("OpenAI", e) from e
-        # Other exceptions (like requests exceptions) are handled by the decorators
-
-
-class GeminiProvider(LLMProvider):
-    """
-    Provider for Google's Gemini API.
-    """
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model: str = "gemini-pro",
-        temperature: float = 0.5,
-    ):
-        """
-        Initialize the Google Gemini provider.
-
-        Args:
-            api_key (Optional[str]): API key. Uses GEMINI_API_KEY env var if None.
-            model (str): Model identifier. Defaults to "gemini-pro".
-            temperature (float): Controls randomness. Defaults to 0.5.
-
-        Raises:
-            AuthenticationError: If no API key is found.
-        """
-        super().__init__(temperature)
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        self.model = model
-        # Correct API endpoint structure
-        self.api_url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        )
-
-        if not self.api_key:
-            logger.error(
-                "No Gemini API key provided or found in environment variable GEMINI_API_KEY."
-            )
-            raise AuthenticationError("No Gemini API key provided.")
-        logger.info(f"GeminiProvider initialized with model: {self.model}")
-
-    @retry()  # Use default retry settings
-    @handle_provider_exceptions("Gemini")
-    def query(self, prompt: str, conversation: Optional[Conversation] = None) -> str:
-        """
-        Send a query to Google's Gemini API. See base class for Args and Raises.
-        """
-        # API key check handled by init and handle_provider_exceptions
-
-        # Format the conversation for Gemini API
-        contents = []
-        system_instruction = None  # Gemini v1beta uses systemInstruction field
-
-        if conversation:
-            # Add user prompt first
-            conversation.add_user_message(prompt)
-            # Process messages, extracting system message if present
-            for message in conversation.messages:
-                if message.role == "system":
-                    # Use the *last* system message found as the system instruction
-                    system_instruction = {"parts": [{"text": message.content}]}
-                else:
-                    # Map roles: user -> user, assistant -> model
-                    role = "user" if message.role == "user" else "model"
-                    contents.append({"role": role, "parts": [{"text": message.content}]})
-        else:
-            # Simple query, no history
-            contents = [{"role": "user", "parts": [{"text": prompt}]}]
-
-        data: Dict[str, Any] = {
-            "contents": contents,
-            "generationConfig": {"temperature": self._temperature},
-        }
-        # Add system instruction if it was found
-        if system_instruction:
-            data["systemInstruction"] = system_instruction
-
-        logger.debug(f"Sending request to Gemini: {data}")
-
-        # Make the API call (key is passed as query param)
-        url = f"{self.api_url}?key={self.api_key}"
-        response = requests.post(url, json=data, timeout=60)  # Gemini can be slower
-
-        # Let handle_provider_exceptions deal with HTTP errors
-        response.raise_for_status()
-
-        # Process successful response (200 OK)
-        try:
-            response_data = response.json()
-            logger.debug(f"Received response from Gemini: {response_data}")
-
-            # Safely extract content using .get()
-            candidates = response_data.get("candidates")
-            if not candidates:
-                logger.error(f"No 'candidates' field found in Gemini response: {response_data}")
-                raise ValueError("No candidates found in Gemini API response")
-
-            first_candidate = candidates[0]
-            content_part = first_candidate.get("content", {}).get("parts", [{}])[0]
-            content = content_part.get("text")
-
-            if content is None:
-                logger.error(f"Missing 'text' field in Gemini response part: {response_data}")
-                raise ValueError("Missing 'text' field in response part")
-
-            # Add the assistant's response to the conversation *after* successful retrieval
-            if conversation:
-                conversation.add_assistant_message(content)
-
-            return content
-
-        # FIX: Catch only specific parsing/validation errors here
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
-            logger.error(
-                f"Error parsing Gemini response: {response.text} | Error: {e}", exc_info=True
-            )
-            raise ProviderError("Gemini", e) from e
-        # Other exceptions handled by decorators
-
-
-class ClaudeProvider(LLMProvider):
-    """
-    Provider for Anthropic's Claude API.
-    """
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model: str = "claude-3-opus-20240229",  # Default to a known recent model
-        temperature: float = 0.5,
-    ):
-        """
-        Initialize the Anthropic Claude provider.
-
-        Args:
-            api_key (Optional[str]): API key. Uses ANTHROPIC_API_KEY env var if None.
-            model (str): Model identifier. Defaults to "claude-3-opus-20240229".
-            temperature (float): Controls randomness. Defaults to 0.5.
-
-        Raises:
-            AuthenticationError: If no API key is found.
-        """
-        super().__init__(temperature)
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        self.model = model
-        self.api_url = "https://api.anthropic.com/v1/messages"
-        self.api_version = "2023-06-01"  # Required header
-
-        if not self.api_key:
-            logger.error(
-                "No Anthropic API key provided or found in environment variable ANTHROPIC_API_KEY."
-            )
-            raise AuthenticationError("No Anthropic API key provided.")
-        logger.info(f"ClaudeProvider initialized with model: {self.model}")
-
-    @retry()  # Use default retry settings
-    @handle_provider_exceptions("Claude")
-    def query(self, prompt: str, conversation: Optional[Conversation] = None) -> str:
-        """
-        Send a query to Anthropic's Claude API. See base class for Args and Raises.
-        """
-        # API key check handled by init and handle_provider_exceptions
-
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": self.api_version,
-            "Content-Type": "application/json",
-        }
-
-        # Format conversation for Claude API
-        system_prompt_content = None
-        current_messages = []
-        if conversation:
-            # Add user prompt first
-            conversation.add_user_message(prompt)
-            # Separate system message from user/assistant messages
-            for message in conversation.messages:
-                if message.role == "system":
-                    # Use the *last* system message found
-                    system_prompt_content = message.content
-                else:
-                    # Roles match Claude's API (user, assistant)
-                    current_messages.append({"role": message.role, "content": message.content})
-        else:
-            current_messages = [{"role": "user", "content": prompt}]
-
-        # Construct payload
-        data: Dict[str, Any] = {
-            "model": self.model,
-            "messages": current_messages,
-            "temperature": self._temperature,
-            "max_tokens": 4096,  # Recommended practice for Claude
-        }
-        if system_prompt_content:
-            data["system"] = system_prompt_content  # Add system prompt if present
-
-        logger.debug(f"Sending request to Claude: {data}")
-
-        # Make the API call
-        response = requests.post(
-            self.api_url,
-            headers=headers,
-            json=data,
-            timeout=60,  # Slightly longer timeout for Claude
-        )
-
-        # Let handle_provider_exceptions deal with HTTP errors
-        response.raise_for_status()
-
-        # Process successful response (200 OK)
-        try:
-            response_data = response.json()
-            logger.debug(f"Received response from Claude: {response_data}")
-
-            # Ensure 'content' exists and is a list
-            content_blocks = response_data.get("content")
-            if not isinstance(content_blocks, list):
-                logger.error(f"Response 'content' is not a list or is missing: {response_data}")
-                raise ValueError("Response missing or invalid 'content' field")
-
-            # Find the first text block and extract its text
-            text_content = ""
-            for block in content_blocks:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_content = block.get("text", "")  # Use get with default
-                    break  # Assuming we only want the first text block
-
-            # Check if any text content was actually found
-            # Allow empty string as a valid response, but log if needed.
-            if not text_content and text_content != "":
-                logger.warning(f"No 'text' content block found in Claude response: {response_data}")
-                # Decide if this is an error or just an empty response
-                # For now, let's allow empty string through but raise if no text block found at all
-                raise ValueError("No 'text' content block found in response")
-
-            # Add the assistant's response to the conversation *after* successful retrieval
-            if conversation:
-                conversation.add_assistant_message(text_content)
-
-            return text_content
-
-        # FIX: Catch only specific parsing/validation errors here
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
-            logger.error(
-                f"Error parsing Claude response: {response.text} | Error: {e}", exc_info=True
-            )
-            raise ProviderError("Claude", e) from e
-        # Other exceptions handled by decorators
-
-
-class LLMInterfaceConfig:
-    """
-    Configuration data class for LLMInterface.
-    """
-
-    def __init__(
-        self,
-        provider: str,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        system_message: Optional[str] = None,
-        temperature: float = 0.5,
-    ):
-        """
-        Initialize the configuration.
-
-        Args:
-            provider (str): 'openai', 'gemini', or 'claude'.
-            api_key (Optional[str]): API key. Defaults to None.
-            model (Optional[str]): Model identifier. Defaults to None.
-            system_message (Optional[str]): System message. Defaults to None.
-            temperature (float): Generation temperature. Defaults to 0.5.
-        """
-        self.provider = provider
-        self.api_key = api_key
-        self.model = model
-        self.system_message = system_message
-        # Clamp temperature on config creation as well
-        self.temperature = max(0.0, min(1.0, temperature))
-
-
-class LLMInterface:
-    """
-    Unified interface for working with multiple LLM providers.
-    """
-
-    def __init__(
-        self,
-        provider: str = "openai",
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        system_message: Optional[str] = None,
-        temperature: float = 0.5,
-        role_name: Optional[str] = None,
-        role_description: Optional[str] = None,
-    ):
-        """
-        Initialize the unified LLM interface.
-
-        Args:
-            provider (str): 'openai', 'gemini', or 'claude'. Defaults to "openai".
-            api_key (Optional[str]): API key. Defaults to None (uses env vars).
-            model (Optional[str]): Model identifier. Defaults to provider default.
-            system_message (Optional[str]): System message. Defaults to None.
-            temperature (float): Generation temperature (0.0-1.0). Defaults to 0.5.
-
-        Raises:
-            ValueError: If an unsupported provider is specified.
-            AuthenticationError: If the selected provider requires an API key and none is found.
-        """
-        # Store raw init args for get_current_config
-        self._init_api_key = api_key
-        self._init_model = model
-
-        # Clamp temperature immediately
-        self.temperature = max(0.0, min(1.0, temperature))
-        if self.temperature != temperature:
-            logger.warning(f"Initial temperature {temperature} clamped to {self.temperature}.")
-
-        self.provider_name = provider.lower()
-        # Provider initialization might raise AuthenticationError
-        self.provider = self._initialize_provider(self.provider_name, api_key, model)
-
-        # Initialize conversation only if a system message is provided
-        self.conversation: Optional[Conversation] = None
-        self.system_message: Optional[str] = None  # Track the intended system message separately
-        if system_message:
-            self.update_system_message(
-                system_message
-            )  # Use method to ensure conversation is created
-
-        # Initialize role name and description if provided
-        self.role_name = role_name
-        self.role_description = role_description
-
-        logger.info(f"LLMInterface initialized for provider: {self.provider_name}")
-
-    def _initialize_provider(
-        self,
-        provider_name: str,  # Use consistent naming
-        api_key: Optional[str],
-        model: Optional[str],
-    ) -> LLMProvider:
-        """
-        Internal factory method to create and return the appropriate provider instance.
-
-        Args:
-            provider_name (str): The LLM provider name.
-            api_key (Optional[str]): API key.
-            model (Optional[str]): Model identifier.
-
-        Returns:
-            LLMProvider: An initialized provider instance.
-
-        Raises:
-            ValueError: If provider_name is unsupported.
-            AuthenticationError: If API key is required and missing for the provider.
-        """
-        provider_name_lower = provider_name.lower()
-        if provider_name_lower == "openai":
-            return OpenAIProvider(
-                api_key=api_key, model=model or "gpt-4", temperature=self.temperature
-            )
-        elif provider_name_lower == "gemini":
-            return GeminiProvider(
-                api_key=api_key,
-                model=model or "gemini-pro",
-                temperature=self.temperature,
-            )
-        elif provider_name_lower == "claude":
-            return ClaudeProvider(
-                api_key=api_key,
-                model=model or "claude-3-opus-20240229",
-                temperature=self.temperature,
-            )
-        else:
-            logger.error(f"Attempted to initialize unsupported provider: {provider_name}")
-            raise ValueError(
-                f"Unsupported provider: {provider_name}. Choose from 'openai', 'gemini', or 'claude'."
-            )
-
-    def get_role_name(self) -> Optional[str]:
-        """
-        Get the role name for the assistant.
-
-        Returns:
-            Optional[str]: The role name, or None if not set.
-        """
-        return self.role_name
-
-    def get_role_description(self) -> Optional[str]:
-        """
-        Get the role description for the assistant.
-
-        Returns:
-            Optional[str]: The role description, or None if not set.
-        """
-        return self.role_description
-
-    def _start_conversation(self, system_message_content: Optional[str] = None) -> None:
-        """
-        Starts a new conversation, replacing the existing one.
-
-        Args:
-            system_message_content (Optional[str]): Content for the system message. Defaults to None.
-        """
-        self.conversation = Conversation(system_message_content)
-        # Update the interface's tracked system message
-        self.system_message = system_message_content
-        logger.info(f"Started new conversation for {self.provider_name} provider.")
-        if system_message_content:
-            logger.debug(f"New conversation started with system message.")
-
-    def update_system_message(self, system_message_content: str) -> None:
-        """
-        Update the system message. Creates a conversation if one doesn't exist.
-
-        Args:
-            system_message_content (str): The new system message content.
-        """
-        self.system_message = system_message_content  # Update tracked system message
-        if not self.conversation:
-            # If no conversation exists, start a new one with this system message
-            self._start_conversation(system_message_content)
-        else:
-            # If a conversation exists, update its system message
-            self.conversation.set_system_message(system_message_content)
-            logger.info("Updated system message in the current conversation.")
-
-    def is_system_message_set(self) -> bool:
-        """
-        Check if a system message is currently set for the interface.
-
-        Returns:
-            bool: True if a system message is set, False otherwise.
-        """
-        return self.system_message is not None
-
-    def get_system_message(self) -> Optional[str]:
-        """
-        Get the current system message set for the interface.
-
-        Returns:
-            Optional[str]: The system message content, or None if not set.
-        """
-        return self.system_message
 
     def query(
         self,
         prompt: str,
-        use_conversation: bool = False,
-        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        use_conversation: bool = True,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """
-        Send a query to the current LLM provider.
+        Sends a prompt to the LLM and returns the response.
 
-        The interface's configured `system_message` is ALWAYS used.
-        If `conversation_history` is provided, any system message within it is IGNORED,
-        and the interface's system message is applied instead.
+        Manages conversation history internally if use_conversation is True.
+        If use_conversation is False, it uses the provided conversation_history (if any)
+        or just the system message (if set) and the current prompt for a stateless call.
 
         Args:
-            prompt (str): The prompt to send.
-            use_conversation (bool): Use and update the interface's internal conversation state. Defaults to False.
-            conversation_history (Optional[List[Dict[str, Any]]]): Initialize a *temporary*
-                conversation from this history for a single query (ignoring its system message).
-                Ignored if use_conversation is True. Defaults to None.
+            prompt: The user's input prompt.
+            use_conversation: If True, use and update the internal conversation history.
+                              If False, perform a stateless query.
+            conversation_history: Optional list of messages for stateless queries.
+                                  Ignored if use_conversation is True.
 
         Returns:
-            str: Text response from the LLM.
+            The LLM's response content as a string.
 
         Raises:
-            LLMError subclasses: Propagates errors from the provider's query method.
+            LLMConfigurationError: For configuration issues (API key, model).
+            LLMClientError: For client-side issues (network, unexpected errors).
+            LLMResponseError: For API errors (rate limits, bad request, blocked content).
         """
-        target_conversation: Optional[Conversation] = None
+        messages_to_send: List[Dict[str, str]]
+        last_user_message_added_to_internal_convo = False  # Track changes to internal state
 
-        if use_conversation:
-            # Use the internal conversation state
-            if not self.conversation:
-                self._start_conversation(
-                    self.system_message
-                )  # Ensure internal conversation exists with correct system msg
-            target_conversation = self.conversation
-            logger.debug("Using internal conversation state for query.")
-
-        elif conversation_history:
-            # Create a temporary conversation using the INTERFACE'S system message,
-            # then populate with user/assistant messages from the provided history.
-            logger.debug(
-                "Using provided history; applying INTERFACE system message and ignoring history's system message."
-            )
-            # Start temporary conversation with the interface's system message
-            target_conversation = Conversation(self.system_message)
-
-            # Add only user/assistant messages from the provided history
-            for msg in conversation_history:
-                role = msg.get("role")
-                content = msg.get("content")
-                if role == "user" and content is not None:
-                    target_conversation.add_user_message(content)
-                elif role == "assistant" and content is not None:
-                    target_conversation.add_assistant_message(content)
-                # System messages from history are deliberately ignored
-            logger.debug(
-                f"Temporary context created with interface system message and {len(target_conversation.messages) - (1 if self.system_message else 0)} user/assistant messages from history."
-            )
-
-        else:
-            # Simple query: Create a temporary conversation context that ONLY includes
-            # the interface's system message, if one is set.
-            logger.debug("Performing simple query. Including interface system message if set.")
-            if self.system_message:
-                target_conversation = Conversation(self.system_message)
-                logger.debug("Temporary context created with interface system message.")
-            else:
-                target_conversation = None  # No system message, no history -> pass None
-                logger.debug("No interface system message set. Querying without system context.")
-
-        # --- Query Execution ---
         try:
-            # Pass the prompt and the prepared conversation object (or None)
-            # The provider's query method will add the prompt to the conversation object.
-            response = self.provider.query(prompt, target_conversation)
-            logger.info(f"Query successful for provider {self.provider_name}.")
+            if use_conversation:
+                # --- Stateful Query ---
+                # Ensure the internal conversation object has the correct system message
+                if self._system_message != self.conversation.system_message:
+                    self.conversation.add_message(role="system", content=self._system_message)
 
-            # If use_conversation=True, target_conversation is self.conversation,
-            # and the provider added the assistant response to it.
-            # If temporary, we don't care about the assistant response being added to it.
-            return response
-        except LLMError as e:
-            logger.error(f"LLM query failed: {type(e).__name__} - {e}", exc_info=False)
-            raise
-        except Exception as e:
-            logger.exception(f"Unexpected error during provider query execution: {e}")
-            raise LLMError(f"Unexpected error during query: {e}") from e
+                # Add the current user prompt to the internal conversation
+                self.conversation.add_user_message(prompt)
+                last_user_message_added_to_internal_convo = True
+                messages_to_send = self.conversation.get_messages()
+                logger.debug(f"Using internal conversation with {len(messages_to_send)} messages.")
 
-    def export_conversation(self) -> Dict[str, Any]:
-        """
-        Export the current internal conversation state.
-
-        Returns:
-            Dict[str, Any]: Dictionary with provider, messages, timestamp. Empty if no conversation.
-        """
-        if not self.conversation:
-            logger.warning("Attempted to export, but no active conversation exists.")
-            return {}
-
-        export_data = {
-            "provider": self.provider_name,  # Reflects current provider
-            "messages": self.conversation.get_messages(),
-            "timestamp": time.time(),
-        }
-        logger.info(f"Exported conversation with {len(export_data['messages'])} messages.")
-        return export_data
-
-    def import_conversation(
-        self, conversation_data: Dict[str, Any], include_system_message: bool = True
-    ) -> None:
-        """
-        Import conversation data, replacing the current internal conversation.
-
-        Args:
-            conversation_data (Dict[str, Any]): Data from export_conversation. Must contain 'messages'.
-            include_system_message (bool): If True, use system message from data.
-                                           If False, keep the interface's current system message. Defaults to True.
-        """
-        if "messages" not in conversation_data:
-            logger.error("Import failed: 'messages' key missing in conversation_data.")
-            raise ValueError("'messages' key is required in conversation_data for import.")
-
-        imported_messages = conversation_data["messages"]
-        new_system_message_content: Optional[str] = None
-
-        # Determine the system message for the new conversation
-        if include_system_message:
-            # Try to find system message in imported data
-            for message in imported_messages:
-                if message.get("role") == "system":
-                    new_system_message_content = message.get("content")
-                    break  # Use the first one found
-            logger.debug(
-                f"Importing with system message from data: {bool(new_system_message_content)}"
-            )
-        else:
-            # Keep the existing system message of the interface
-            new_system_message_content = self.system_message
-            logger.debug(
-                f"Importing, keeping existing system message: {bool(new_system_message_content)}"
-            )
-
-        # Start a new conversation with the determined system message
-        # This replaces self.conversation and sets self.system_message correctly
-        self._start_conversation(new_system_message_content)
-
-        # Add all non-system messages from the imported data
-        messages_added = 0
-        if self.conversation:  # Should always be true after _start_conversation
-            for message in imported_messages:
-                role = message.get("role")
-                content = message.get("content")
-                if role == "system":
-                    continue  # System message already handled
-                elif role == "user" and content is not None:
-                    self.conversation.add_user_message(content)
-                    messages_added += 1
-                elif role == "assistant" and content is not None:
-                    self.conversation.add_assistant_message(content)
-                    messages_added += 1
+            else:
+                # --- Stateless Query ---
+                if conversation_history is not None:
+                    # Use provided history
+                    messages_to_send = list(conversation_history)  # Create a copy
+                    # Ensure system message is prepended if defined and not already present
+                    if self._system_message and not any(
+                        m.get("role") == "system" for m in messages_to_send
+                    ):
+                        messages_to_send.insert(
+                            0, {"role": "system", "content": self._system_message}
+                        )
                 else:
-                    logger.warning(f"Skipping invalid message during import: {message}")
+                    # Start fresh, only system message (if any) and prompt
+                    messages_to_send = []
+                    if self._system_message:
+                        messages_to_send.append({"role": "system", "content": self._system_message})
 
-        logger.info(f"Imported conversation. Added {messages_added} user/assistant messages.")
+                # Add the current user prompt
+                messages_to_send.append({"role": "user", "content": prompt})
+                logger.debug(f"Performing stateless query with {len(messages_to_send)} messages.")
 
-    def switch_provider(
-        self,
-        new_provider: str,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        system_message: Optional[str] = None,  # Option to set a new system message on switch
-        switch_conversation_roles: bool = True,
-    ) -> None:
-        """
-        Switch to a different LLM provider, preserving conversation context.
+            # --- API Call (Common for both stateful/stateless) ---
+            response_content = self._call_api(messages_to_send)
+            # --- Success ---
+
+            if use_conversation:
+                # Add successful assistant response to internal conversation
+                # This implicitly assumes the last message added was the user prompt
+                self.conversation.add_assistant_message(response_content)
+                logger.debug("Added assistant response to internal conversation.")
+
+            return response_content
+
+        except (LLMClientError, LLMConfigurationError, LLMResponseError) as e:
+            logger.error(f"Error during LLM query for {self.__class__.__name__}: {e}")
+            # If using internal conversation and we added the user message that failed, remove it
+            if use_conversation and last_user_message_added_to_internal_convo:
+                if self.conversation.messages and self.conversation.messages[-1].role == "user":
+                    removed_msg = self.conversation.messages.pop()
+                    logger.debug(
+                        f"Removed last user message ('{removed_msg.content[:50]}...') from internal history due to API error."
+                    )
+                else:
+                    logger.warning(
+                        "Attempted to remove last user message due to error, but history state was unexpected."
+                    )
+            raise  # Re-raise the caught convorator exception
+
+        except Exception as e:
+            logger.exception(
+                f"Unexpected error during LLM query for {self.__class__.__name__}: {e}"
+            )
+            # Handle removal for unexpected errors too
+            if use_conversation and last_user_message_added_to_internal_convo:
+                if self.conversation.messages and self.conversation.messages[-1].role == "user":
+                    removed_msg = self.conversation.messages.pop()
+                    logger.debug(
+                        f"Removed last user message ('{removed_msg.content[:50]}...') from internal history due to unexpected error."
+                    )
+                else:
+                    logger.warning(
+                        "Attempted to remove last user message due to unexpected error, but history state was unexpected."
+                    )
+            # Wrap unexpected errors in LLMClientError
+            raise LLMClientError(f"An unexpected error occurred during LLM query: {e}") from e
+
+    def get_conversation_history(self) -> List[Dict[str, str]]:
+        """Returns the current internal conversation history."""
+        return self.conversation.get_messages()
+
+    def clear_conversation(self, keep_system: bool = True):
+        """Clears the internal conversation history.
 
         Args:
-            new_provider (str): The provider to switch to ('openai', 'gemini', 'claude').
-            api_key (Optional[str]): API key for the new provider. Defaults to None (uses env vars).
-            model (Optional[str]): Model for the new provider. Defaults to None (provider default).
-            temperature (Optional[float]): New temperature. Defaults to None (keeps current).
-            system_message (Optional[str]): Optionally set a new system message. Defaults to None (keeps current).
-            switch_conversation_roles (bool): Switch user/assistant roles in history. Defaults to True.
+            keep_system: If True, retains the system message (if one is set).
+                         If False, clears all messages including the system message.
+        """
+        self.conversation.clear(keep_system=keep_system)
+        # If clearing completely, also clear the interface's system message attribute
+        if not keep_system:
+            self._system_message = None
+
+    def get_system_message(self) -> Optional[str]:
+        """Returns the configured system message."""
+        return self._system_message
+
+    def set_system_message(self, message: Optional[str]):
+        """Sets or updates the system message for subsequent queries."""
+        if message != self._system_message:
+            logger.debug(f"Setting system message to: '{message}'")
+            self._system_message = message
+            # Update the conversation object immediately if it exists
+            if hasattr(self, "conversation"):
+                self.conversation.add_message(role="system", content=message)
+        else:
+            logger.debug("System message is already set to the desired value.")
+
+    def get_role_name(self) -> Optional[str]:
+        """Returns the configured assistant role name (cosmetic)."""
+        return self._role_name
+
+    def set_role_name(self, name: str):
+        """Sets the assistant role name (cosmetic)."""
+        logger.debug(f"Setting role name to: '{name}'")
+        self._role_name = name
+
+
+# --- Concrete LLM Client Implementations ---
+
+
+class OpenAILLM(LLMInterface):
+    """Concrete implementation for OpenAI's API (GPT models)."""
+
+    # List common/recent models. The API might support others.
+    SUPPORTED_MODELS = [
+        "gpt-4o",
+        "gpt-4-turbo",
+        "gpt-4-turbo-preview",
+        "gpt-4-0125-preview",
+        "gpt-4-1106-preview",
+        "gpt-4-vision-preview",
+        "gpt-4",
+        "gpt-4-0613",
+        "gpt-4-32k",
+        "gpt-4-32k-0613",
+        "gpt-3.5-turbo-0125",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-1106",
+        "gpt-3.5-turbo-instruct",
+        "gpt-3.5-turbo-16k",
+        "gpt-3.5-turbo-0613",
+        "gpt-3.5-turbo-16k-0613",
+    ]
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gpt-4o",  # Default to the latest powerful model
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        system_message: Optional[str] = None,
+        role_name: Optional[str] = None,
+    ):
+        """Initializes the OpenAI client.
+
+        Requires the 'openai' package to be installed (`pip install openai`).
 
         Raises:
-            ValueError: If new_provider is unsupported.
-            AuthenticationError: If API key is required and missing for the new provider.
+            LLMConfigurationError: If API key is missing or client initialization fails.
         """
-        logger.info(f"Switching provider from {self.provider_name} to {new_provider}")
+        try:
+            import openai
 
-        # Update temperature if provided
-        if temperature is not None:
-            new_temp_clamped = max(0.0, min(1.0, temperature))
-            if new_temp_clamped != self.temperature:
-                self.temperature = new_temp_clamped
-                logger.info(f"Temperature updated to {self.temperature}")
-            if new_temp_clamped != temperature:
-                logger.warning(f"Provided temperature {temperature} clamped to {self.temperature}.")
+            self.openai = openai  # Store the module for access to error types
+        except ImportError as e:
+            raise LLMConfigurationError(
+                "OpenAI Python package not found. Please install it using 'pip install openai'."
+            ) from e
 
-        # Store new init keys/models for get_current_config consistency
-        self._init_api_key = api_key
-        self._init_model = model
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise LLMConfigurationError(
+                "OpenAI API key not provided. Set the OPENAI_API_KEY environment variable or pass it during initialization."
+            )
 
-        # Initialize the new provider (might raise errors)
-        self.provider = self._initialize_provider(new_provider, api_key, model)
-        self.provider_name = new_provider.lower()
+        if model not in self.SUPPORTED_MODELS:
+            logger.warning(
+                f"Model '{model}' is not in the explicitly supported list for OpenAILLM ({self.SUPPORTED_MODELS}). Proceeding, but compatibility is not guaranteed."
+            )
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
 
-        # Update system message if provided
-        if system_message is not None:
-            self.update_system_message(system_message)  # This handles conversation creation/update
+        try:
+            # Initialize the OpenAI client instance
+            self.client = self.openai.OpenAI(api_key=self.api_key)
+        except Exception as e:
+            # Catch potential errors during client init (e.g., invalid key format - though API call usually catches this)
+            raise LLMConfigurationError(f"Failed to initialize OpenAI client: {e}") from e
 
-        # Switch roles in the existing conversation if requested and conversation exists
-        if switch_conversation_roles and self.conversation:
-            self.conversation.switch_conversation_roles()
-            logger.info("Switched conversation roles due to provider switch.")
-        elif switch_conversation_roles and not self.conversation:
-            logger.warning("Requested role switch, but no active conversation exists.")
-
-        logger.info(f"Successfully switched to {self.provider_name} provider.")
-
-    def switch_conversation_roles(self) -> None:
-        """
-        Switch the roles ('user' <-> 'assistant') in the current internal conversation.
-        """
-        if not self.conversation:
-            logger.warning("Attempted to switch roles, but no active conversation exists.")
-            return
-
-        self.conversation.switch_conversation_roles()
-        logger.info("Switched conversation roles.")
-
-    def get_current_config(self) -> LLMInterfaceConfig:
-        """
-        Get the current configuration of the LLM interface.
-
-        Returns:
-            LLMInterfaceConfig: Object containing current configuration parameters.
-        """
-        return LLMInterfaceConfig(
-            provider=self.provider_name,
-            # Return the keys/models used at the *last* init/switch for consistency
-            api_key=self._init_api_key,
-            model=self._init_model,
-            system_message=self.system_message,  # Use the tracked system message
-            temperature=self.temperature,
+        self._system_message = system_message
+        self._role_name = role_name or "Assistant"
+        # Initialize conversation with the system message
+        self.conversation = Conversation(system_message=self._system_message)
+        logger.info(
+            f"OpenAILLM initialized. Model: {self.model}, Temperature: {self.temperature}, Max Tokens: {self.max_tokens}"
         )
 
-    def add_user_message(self, content: str) -> None:
+    def _call_api(self, messages: List[Dict[str, str]]) -> str:
+        """Calls the OpenAI Chat Completions API."""
+        if not messages:
+            raise LLMClientError("Cannot call OpenAI API with an empty message list.")
+
+        logger.debug(
+            f"Calling OpenAI API ({self.model}) with {len(messages)} messages. First message role: {messages[0].get('role')}"
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,  # API expects list of {'role': str, 'content': str}
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+
+            # --- Response Validation ---
+            if not response.choices:
+                logger.error(f"OpenAI response missing 'choices'. Response: {response}")
+                raise LLMResponseError(f"Invalid response structure from OpenAI: No 'choices'.")
+
+            first_choice = response.choices[0]
+            if not first_choice.message:
+                logger.error(f"OpenAI response choice missing 'message'. Response: {response}")
+                raise LLMResponseError(
+                    f"Invalid response structure from OpenAI: Choice missing 'message'."
+                )
+
+            content = first_choice.message.content
+
+            if content is None:
+                # Check finish reason if content is None
+                finish_reason = first_choice.finish_reason
+                logger.error(
+                    f"OpenAI response content is null. Finish Reason: {finish_reason}. Response: {response}"
+                )
+                # Map common reasons to errors
+                if finish_reason == "content_filter":
+                    raise LLMResponseError("OpenAI response blocked due to content filter.")
+                elif finish_reason == "length":
+                    raise LLMResponseError(
+                        f"OpenAI response truncated due to max_tokens ({self.max_tokens}) or other length limits."
+                    )
+                else:
+                    raise LLMResponseError(
+                        f"OpenAI returned null content. Finish Reason: {finish_reason}."
+                    )
+
+            content = content.strip()
+            logger.debug(
+                f"Received content from OpenAI API. Length: {len(content)}. Finish Reason: {first_choice.finish_reason}"
+            )
+            if not content and first_choice.finish_reason == "stop":
+                logger.warning(
+                    f"Received empty content string from OpenAI API, but finish reason was 'stop'. Response: {response}"
+                )
+                # Decide if empty content with 'stop' is an error or valid (e.g., model chose not to respond)
+                # For now, let's return it, but a stricter check might raise LLMResponseError here.
+
+            return content
+
+        # --- Error Handling ---
+        except self.openai.APIConnectionError as e:
+            logger.error(f"OpenAI API connection error: {e}")
+            raise LLMClientError(f"Network error connecting to OpenAI API: {e}") from e
+        except self.openai.RateLimitError as e:
+            logger.error(f"OpenAI API rate limit exceeded: {e}")
+            raise LLMResponseError(
+                f"OpenAI API rate limit exceeded. Check your plan and usage limits. Error: {e}"
+            ) from e
+        except self.openai.AuthenticationError as e:
+            logger.error(f"OpenAI API authentication error: {e}")
+            raise LLMConfigurationError(
+                f"OpenAI API authentication failed. Check your API key. Error: {e}"
+            ) from e
+        except self.openai.PermissionDeniedError as e:
+            logger.error(f"OpenAI API permission denied: {e}")
+            raise LLMConfigurationError(
+                f"OpenAI API permission denied. Check API key permissions or organization access. Error: {e}"
+            ) from e
+        except self.openai.NotFoundError as e:
+            logger.error(f"OpenAI API resource not found (e.g., model): {e}")
+            raise LLMConfigurationError(
+                f"OpenAI API resource not found (check model name '{self.model}'?). Error: {e}"
+            ) from e
+        except self.openai.BadRequestError as e:  # Often indicates input schema issues
+            logger.error(f"OpenAI API bad request error: {e}")
+            raise LLMResponseError(
+                f"OpenAI API reported a bad request (check message format or parameters?). Error: {e}"
+            ) from e
+        except self.openai.APIStatusError as e:  # Catch other 4xx/5xx errors
+            logger.error(f"OpenAI API status error: {e.status_code} - {e.response}")
+            # Attempt to extract a message from the response body if possible
+            error_detail = str(e)
+            try:
+                error_json = e.response.json()
+                error_detail = error_json.get("error", {}).get("message", str(e))
+            except:  # Handle cases where response is not JSON or parsing fails
+                pass
+            raise LLMResponseError(
+                f"OpenAI API returned an error (Status {e.status_code}): {error_detail}"
+            ) from e
+        # Catch other potential OpenAI client errors
+        except self.openai.OpenAIError as e:
+            logger.error(f"An unexpected OpenAI client error occurred: {e}")
+            raise LLMClientError(f"An unexpected OpenAI client error occurred: {e}") from e
+        # General exception catcher (less likely with specific catches above)
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred during OpenAI API call: {e}")
+            raise LLMClientError(f"Unexpected error during OpenAI API call: {e}") from e
+
+
+class AnthropicLLM(LLMInterface):
+    """Concrete implementation for Anthropic's API (Claude models)."""
+
+    SUPPORTED_MODELS = [
+        "claude-3-opus-20240229",
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307",
+        "claude-2.1",
+        "claude-2.0",
+        "claude-instant-1.2",
+    ]
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "claude-3-haiku-20240307",  # Default to fast/cheap Haiku
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        system_message: Optional[str] = None,
+        role_name: Optional[str] = None,
+    ):
+        """Initializes the Anthropic client.
+
+        Requires the 'anthropic' package to be installed (`pip install anthropic`).
+
+        Raises:
+            LLMConfigurationError: If API key is missing or client initialization fails.
         """
-        Add a user message to the current conversation without querying the LLM.
-        Creates a conversation if one doesn't exist.
+        try:
+            import anthropic
+
+            self.anthropic = anthropic
+        except ImportError as e:
+            raise LLMConfigurationError(
+                "Anthropic Python package not found. Please install it using 'pip install anthropic'."
+            ) from e
+
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            raise LLMConfigurationError(
+                "Anthropic API key not provided. Set the ANTHROPIC_API_KEY environment variable or pass it during initialization."
+            )
+
+        if model not in self.SUPPORTED_MODELS:
+            logger.warning(
+                f"Model '{model}' is not in the explicitly supported list for AnthropicLLM ({self.SUPPORTED_MODELS}). Proceeding, but compatibility is not guaranteed."
+            )
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+
+        try:
+            self.client = self.anthropic.Anthropic(api_key=self.api_key)
+        except Exception as e:
+            raise LLMConfigurationError(f"Failed to initialize Anthropic client: {e}") from e
+
+        self._system_message = system_message  # Stored separately, passed in API call
+        self._role_name = role_name or "Assistant"
+        # Conversation object doesn't need the system message initially for Anthropic
+        self.conversation = Conversation()
+        logger.info(
+            f"AnthropicLLM initialized. Model: {self.model}, Temperature: {self.temperature}, Max Tokens: {self.max_tokens}"
+        )
+
+    def _call_api(self, messages: List[Dict[str, str]]) -> str:
+        """Calls the Anthropic Messages API."""
+        system_prompt = self._system_message  # System prompt is passed separately
+        # Filter out system message from history, ensure roles are 'user'/'assistant'
+        filtered_messages = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "system":
+                # Use the _system_message attribute, ignore system messages in list
+                continue
+            elif role in ["user", "assistant"]:
+                if content is None:
+                    logger.warning(f"Skipping message with role '{role}' because content is None.")
+                    continue
+                filtered_messages.append({"role": role, "content": content})
+            else:
+                logger.warning(
+                    f"Skipping message with unsupported role '{role}' for Anthropic API."
+                )
+
+        if not filtered_messages:
+            raise LLMClientError(
+                "Cannot call Anthropic API with an empty message list (after filtering)."
+            )
+
+        # --- Anthropic API Constraints Validation ---
+        if filtered_messages[0]["role"] != "user":
+            logger.error(
+                f"Anthropic message list must start with 'user' role. First role found: '{filtered_messages[0]['role']}'."
+            )
+            # Attempt to fix by removing leading non-user messages? Or just error out?
+            # Let's error out for now to be explicit.
+            raise LLMClientError("Anthropic requires messages to start with the 'user' role.")
+
+        # Check for alternating roles (simple check)
+        for i in range(len(filtered_messages) - 1):
+            if filtered_messages[i]["role"] == filtered_messages[i + 1]["role"]:
+                logger.warning(
+                    f"Consecutive messages with role '{filtered_messages[i]['role']}' found at index {i}. Anthropic API requires alternating roles."
+                )
+                # Consider raising LLMClientError here if strict adherence is needed.
+
+        logger.debug(
+            f"Calling Anthropic API ({self.model}) with {len(filtered_messages)} messages. System prompt: {'Yes' if system_prompt else 'No'}"
+        )
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                system=system_prompt if system_prompt else None,  # Pass system prompt here
+                messages=filtered_messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+
+            # --- Response Validation ---
+            if not response.content:
+                stop_reason = getattr(response, "stop_reason", "Unknown")
+                logger.error(
+                    f"Anthropic response missing 'content'. Stop Reason: {stop_reason}. Response: {response}"
+                )
+                raise LLMResponseError(
+                    f"Invalid response structure from Anthropic: No 'content'. Stop Reason: {stop_reason}."
+                )
+
+            # Content is a list of blocks, usually one text block for simple chat
+            if not isinstance(response.content, list) or len(response.content) == 0:
+                logger.error(
+                    f"Anthropic response 'content' is not a non-empty list. Type: {type(response.content)}. Response: {response}"
+                )
+                raise LLMResponseError(
+                    f"Invalid response structure from Anthropic: 'content' is not a non-empty list."
+                )
+
+            # Extract text from the first text block if available
+            content_text = None
+            if hasattr(response.content[0], "text"):
+                content_text = response.content[0].text
+
+            if content_text is None:
+                stop_reason = getattr(response, "stop_reason", "Unknown")
+                logger.error(
+                    f"Anthropic response content block missing 'text'. Stop Reason: {stop_reason}. Response: {response}"
+                )
+                # Check stop reason for clues
+                if stop_reason == "max_tokens":
+                    raise LLMResponseError(
+                        f"Anthropic response truncated due to max_tokens ({self.max_tokens})."
+                    )
+                # Add other specific stop reason checks if needed (e.g., 'tool_use' if tools were involved)
+                else:
+                    raise LLMResponseError(
+                        f"Anthropic response content block missing 'text'. Stop Reason: {stop_reason}."
+                    )
+
+            content = content_text.strip()
+            stop_reason = getattr(response, "stop_reason", "Unknown")
+            logger.debug(
+                f"Received content from Anthropic API. Length: {len(content)}. Stop Reason: {stop_reason}"
+            )
+
+            if not content and stop_reason == "stop_sequence":
+                logger.warning(
+                    f"Received empty content string from Anthropic API, but stop reason was 'stop_sequence'. Response: {response}"
+                )
+                # Similar to OpenAI, decide if this is valid or an error. Return empty for now.
+
+            # Check for error stop reasons even if content exists (e.g., partial output before error)
+            if stop_reason == "error":
+                logger.error(
+                    f"Anthropic response indicates an error stop reason. Response: {response}"
+                )
+                raise LLMResponseError("Anthropic API reported an error during generation.")
+
+            return content
+
+        # --- Error Handling ---
+        except self.anthropic.APIConnectionError as e:
+            logger.error(f"Anthropic API connection error: {e}")
+            raise LLMClientError(f"Network error connecting to Anthropic API: {e}") from e
+        except self.anthropic.RateLimitError as e:
+            logger.error(f"Anthropic API rate limit exceeded: {e}")
+            raise LLMResponseError(
+                f"Anthropic API rate limit exceeded. Check your plan and usage limits. Error: {e}"
+            ) from e
+        except self.anthropic.AuthenticationError as e:
+            logger.error(f"Anthropic API authentication error: {e}")
+            raise LLMConfigurationError(
+                f"Anthropic API authentication failed. Check your API key. Error: {e}"
+            ) from e
+        except self.anthropic.PermissionDeniedError as e:
+            logger.error(f"Anthropic API permission denied: {e}")
+            raise LLMConfigurationError(
+                f"Anthropic API permission denied. Check API key permissions. Error: {e}"
+            ) from e
+        except self.anthropic.NotFoundError as e:
+            logger.error(f"Anthropic API resource not found (e.g., model): {e}")
+            raise LLMConfigurationError(
+                f"Anthropic API resource not found (check model name '{self.model}'?). Error: {e}"
+            ) from e
+        except (
+            self.anthropic.BadRequestError
+        ) as e:  # Covers invalid request structure, role issues etc.
+            logger.error(f"Anthropic API bad request error: {e}")
+            # Try to get more details from the error if possible
+            error_detail = str(e)
+            if hasattr(e, "body") and e.body and "error" in e.body and "message" in e.body["error"]:
+                error_detail = e.body["error"]["message"]
+            raise LLMResponseError(
+                f"Anthropic API reported a bad request (check message format/roles?). Error: {error_detail}"
+            ) from e
+        except self.anthropic.APIStatusError as e:  # Catch other 4xx/5xx
+            logger.error(f"Anthropic API status error: {e.status_code} - {e.response}")
+            error_detail = str(e)
+            try:
+                error_json = e.response.json()
+                error_detail = error_json.get("error", {}).get("message", str(e))
+            except:
+                pass
+            raise LLMResponseError(
+                f"Anthropic API returned an error (Status {e.status_code}): {error_detail}"
+            ) from e
+        # Catch other potential Anthropic client errors
+        except self.anthropic.AnthropicError as e:
+            logger.error(f"An unexpected Anthropic client error occurred: {e}")
+            raise LLMClientError(f"An unexpected Anthropic client error occurred: {e}") from e
+        # General exception catcher
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred during Anthropic API call: {e}")
+            raise LLMClientError(f"Unexpected error during Anthropic API call: {e}") from e
+
+
+class GeminiLLM(LLMInterface):
+    """Concrete implementation for Google's Gemini API."""
+
+    SUPPORTED_MODELS = [
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro-latest",
+        "gemini-1.0-pro",
+        # Add older or specific versions if needed, e.g., "gemini-pro" (alias for 1.0)
+    ]
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gemini-1.5-flash-latest",  # Default to flash for speed/cost
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,  # Gemini uses max_output_tokens
+        system_message: Optional[str] = None,
+        role_name: Optional[str] = None,
+    ):
+        """Initializes the Google Gemini client.
+
+        Requires the 'google-generativeai' package (`pip install google-generativeai`).
+
+        Raises:
+            LLMConfigurationError: If API key is missing, configuration fails, or client initialization fails.
+        """
+        try:
+            import google.generativeai as genai
+
+            # Import google API core exceptions for specific error handling
+            import google.api_core.exceptions as google_exceptions
+
+            self.genai = genai
+            self.google_exceptions = google_exceptions
+        except ImportError as e:
+            raise LLMConfigurationError(
+                "Google Generative AI package not found. Please install it using 'pip install google-generativeai'."
+            ) from e
+
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        if not self.api_key:
+            raise LLMConfigurationError(
+                "Google API key not provided. Set the GOOGLE_API_KEY environment variable or pass it during initialization."
+            )
+
+        try:
+            # Configure the API key globally for the genai module
+            self.genai.configure(api_key=self.api_key)
+            logger.info("Google Generative AI SDK configured successfully.")
+        except Exception as e:
+            # Catch potential issues during configure()
+            raise LLMConfigurationError(f"Failed to configure Google API key: {e}") from e
+
+        # Normalize model name (remove 'models/' prefix if present)
+        if model.startswith("models/"):
+            model = model.split("/", 1)[1]
+
+        if model not in self.SUPPORTED_MODELS:
+            logger.warning(
+                f"Model '{model}' is not in the explicitly supported list for GeminiLLM ({self.SUPPORTED_MODELS}). Proceeding, but compatibility is not guaranteed."
+            )
+        self.model_name = model  # Store the potentially normalized name
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+
+        try:
+            # Define generation configuration
+            self.generation_config = self.genai.types.GenerationConfig(
+                # candidate_count=1 # Default is 1, usually no need to change
+                # stop_sequences=... # Optional stop sequences
+                max_output_tokens=self.max_tokens,
+                temperature=self.temperature,
+                # top_p=... # Optional nucleus sampling
+                # top_k=... # Optional top-k sampling
+            )
+        except Exception as e:
+            # Catch potential errors creating GenerationConfig (e.g., invalid values)
+            raise LLMConfigurationError(f"Failed to create Gemini GenerationConfig: {e}") from e
+
+        # Define safety settings (adjust as needed)
+        # Defaults are generally BLOCK_MEDIUM_AND_ABOVE for most categories.
+        # Setting to BLOCK_NONE disables safety filtering for that category (USE WITH CAUTION).
+        self.safety_settings = {
+            # Example: Relax harassment slightly (BLOCK_ONLY_HIGH)
+            # self.genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: self.genai.types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            # Example: Disable hate speech filter (BLOCK_NONE) - Use responsibly!
+            # self.genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: self.genai.types.HarmBlockThreshold.BLOCK_NONE,
+        }
+        if self.safety_settings:
+            logger.warning(
+                f"Using custom safety settings for Gemini: {self.safety_settings}. Be aware of the implications."
+            )
+
+        self._system_message = system_message
+        self._role_name = role_name or "Model"  # Gemini uses 'model' role
+
+        try:
+            # Initialize the generative model instance
+            # Pass system_instruction directly here
+            self.model = self.genai.GenerativeModel(
+                model_name=self.model_name,
+                generation_config=self.generation_config,
+                safety_settings=self.safety_settings,
+                system_instruction=self._system_message if self._system_message else None,
+            )
+            logger.info(f"Gemini GenerativeModel initialized for '{self.model_name}'.")
+        except self.google_exceptions.NotFound as e:
+            logger.error(f"Gemini model '{self.model_name}' not found or access denied: {e}")
+            raise LLMConfigurationError(
+                f"Gemini model '{self.model_name}' not found or access denied. Check model name and API key permissions. Error: {e}"
+            ) from e
+        except Exception as e:
+            # Catch other potential errors during model initialization
+            logger.exception(
+                f"Failed to initialize Gemini GenerativeModel '{self.model_name}': {e}"
+            )
+            raise LLMConfigurationError(
+                f"Failed to initialize Gemini GenerativeModel '{self.model_name}': {e}"
+            ) from e
+
+        # Conversation state for Gemini
+        # Internal conversation uses standard roles ('user', 'assistant')
+        self.conversation = Conversation()
+        # Actual chat session with Gemini API (uses 'user', 'model' roles)
+        self.chat: Optional[genai.ChatSession] = None  # Initialize chat session lazily
+        logger.info(
+            f"GeminiLLM initialized. Model: {self.model_name}, Temperature: {self.temperature}, Max Tokens: {self.max_tokens}"
+        )
+
+    def _translate_roles_for_gemini(self, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """
+        Translates roles from internal standard ('system', 'user', 'assistant')
+        to Gemini's required format ('user', 'model') within a 'contents' list.
+        System message is handled by model initialization or system_instruction,
+        so 'system' roles in the message list are typically skipped.
+        """
+        gemini_history = []
+        valid_roles = {"user": "user", "assistant": "model"}
+        expected_role = (
+            "user"  # Gemini API expects alternating user/model roles, starting with user
+        )
+
+        for i, msg in enumerate(messages):
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if content is None:  # Skip messages without content
+                logger.warning(
+                    f"Skipping message with role '{role}' at index {i} due to None content."
+                )
+                continue
+
+            if role == "system":
+                if i == 0:
+                    # Skip initial system message as it's handled by system_instruction
+                    logger.debug(
+                        "Skipping initial system message in history (handled by system_instruction)."
+                    )
+                    continue
+                else:
+                    # System messages mid-conversation are not directly supported.
+                    # Log a warning and skip. Consider merging with next user message if needed.
+                    logger.warning(
+                        f"System message found mid-conversation at index {i}; skipping for Gemini API call."
+                    )
+                    continue
+
+            translated_role = valid_roles.get(role)
+            if not translated_role:
+                logger.warning(
+                    f"Unsupported role '{role}' encountered at index {i} for Gemini. Skipping message."
+                )
+                continue
+
+            # --- Role Alternation Check ---
+            # If the history is not empty, check if the current role matches the last one
+            if gemini_history and gemini_history[-1]["role"] == translated_role:
+                logger.warning(
+                    f"Role alternation mismatch for Gemini: Consecutive '{translated_role}' roles found. API call might fail or behave unexpectedly."
+                )
+                # Simple fix attempt: skip this message to maintain alternation? Or let API handle?
+                # For now, log warning and include it. API might handle it.
+                # If issues arise, consider raising an error or attempting merging logic here.
+
+            # --- Append to Gemini History ---
+            # Gemini expects content in the format: {'role': ..., 'parts': [{'text': ...}]}
+            gemini_history.append({"role": translated_role, "parts": [{"text": content}]})
+            # Update expected role for the next iteration (not strictly needed as we check against the last appended role)
+            # expected_role = 'model' if translated_role == 'user' else 'user'
+
+        # --- Final Validation ---
+        if gemini_history and gemini_history[0]["role"] != "user":
+            logger.warning(
+                "Gemini history (after translation) does not start with 'user' role. Attempting to proceed, but API may reject."
+            )
+            # Could potentially insert a dummy user message or raise error here.
+
+        return gemini_history
+
+    def _handle_gemini_response(self, response, context: str = "generate_content") -> str:
+        """
+        Helper to process Gemini response object (from generate_content or chat.send_message),
+        extract text content, and handle potential errors like blocking.
 
         Args:
-            content (str): The user message content.
-        """
-        if not self.conversation:
-            # Start conversation using the interface's tracked system message
-            self._start_conversation(self.system_message)
+            response: The response object from the Gemini API call.
+            context: String indicating call context ('generate_content' or 'chat') for logging.
 
-        # We know self.conversation exists now
-        self.conversation.add_user_message(content)
-        logger.info("Manually added user message to conversation.")
+        Returns:
+            The extracted text content.
 
-    def clear_conversation(self) -> None:
+        Raises:
+            LLMResponseError: If the response is blocked, invalid, empty, or indicates an error.
         """
-        Clear the current conversation history, preserving the system message setting.
+        logger.debug(f"Handling Gemini response from '{context}'.")
+
+        # 1. Check for Prompt Feedback (blocking before generation)
+        # Sometimes present even if candidates exist but generation was stopped early.
+        if hasattr(response, "prompt_feedback") and response.prompt_feedback.block_reason:
+            block_reason = response.prompt_feedback.block_reason.name  # Get the enum name
+            safety_ratings_str = str(getattr(response.prompt_feedback, "safety_ratings", "N/A"))
+            logger.error(
+                f"Gemini prompt blocked in '{context}'. Reason: {block_reason}. Safety Ratings: {safety_ratings_str}. Response: {response}"
+            )
+            raise LLMResponseError(
+                f"Gemini prompt blocked due to {block_reason}. Safety: {safety_ratings_str}"
+            )
+
+        # 2. Check for Candidates
+        if not response.candidates:
+            # This might happen if the prompt itself was blocked, or other issues.
+            prompt_feedback_str = str(getattr(response, "prompt_feedback", "N/A"))
+            logger.error(
+                f"Gemini response in '{context}' has no candidates. Prompt Feedback: {prompt_feedback_str}. Response: {response}"
+            )
+            # Check if prompt feedback gives a reason
+            if hasattr(response, "prompt_feedback") and response.prompt_feedback.block_reason:
+                block_reason = response.prompt_feedback.block_reason.name
+                raise LLMResponseError(
+                    f"Gemini response has no candidates, likely due to prompt blocking. Reason: {block_reason}."
+                )
+            else:
+                raise LLMResponseError(
+                    f"Gemini response has no candidates. Prompt Feedback: {prompt_feedback_str}"
+                )
+
+        # 3. Access Content and Check Finish Reason/Safety (within the first candidate)
+        candidate = response.candidates[0]
+        content_text = None
+        finish_reason = "UNKNOWN"  # Default
+        safety_ratings_str = "N/A"  # Default
+
+        try:
+            # Finish reason and safety ratings are usually on the candidate
+            finish_reason = candidate.finish_reason.name if candidate.finish_reason else "UNKNOWN"
+            safety_ratings_str = str(getattr(candidate, "safety_ratings", "N/A"))
+
+            # Content can be inside candidate.content.parts
+            if candidate.content and candidate.content.parts:
+                # Aggregate text from all parts (usually just one)
+                content_text = "".join(
+                    part.text for part in candidate.content.parts if hasattr(part, "text")
+                )
+
+            # Sometimes, the response object has a direct .text attribute (convenience)
+            # Let's prefer the explicit parts extraction but use .text as fallback
+            if content_text is None and hasattr(response, "text"):
+                content_text = response.text
+                logger.debug("Extracted content using response.text fallback.")
+
+            if content_text is None:
+                # If still no text, something is wrong
+                logger.error(
+                    f"Could not extract text content from Gemini candidate in '{context}'. Finish Reason: {finish_reason}. Safety: {safety_ratings_str}. Candidate: {candidate}"
+                )
+                raise LLMResponseError(
+                    f"Could not extract text content from Gemini response. Finish Reason: {finish_reason}. Safety: {safety_ratings_str}"
+                )
+
+        except AttributeError as e:
+            logger.error(
+                f"AttributeError accessing Gemini response candidate details in '{context}': {e}. Response: {response}",
+                exc_info=True,
+            )
+            raise LLMResponseError(f"Error accessing Gemini response structure: {e}") from e
+        except ValueError as e:
+            # This might occur if accessing .text fails due to blocking (though prompt_feedback is primary check)
+            logger.error(
+                f"ValueError accessing Gemini response text in '{context}', potentially due to blocking. Finish Reason: {finish_reason}. Safety: {safety_ratings_str}. Error: {e}. Response: {response}",
+                exc_info=True,
+            )
+            raise LLMResponseError(
+                f"Gemini response blocked or invalid. Finish Reason: {finish_reason}. Safety: {safety_ratings_str}"
+            ) from e
+
+        # 4. Post-extraction Checks (Finish Reason, Safety, Emptiness)
+        content = content_text.strip()
+        logger.debug(
+            f"Received content from Gemini API ({context}). Length: {len(content)}. Finish Reason: {finish_reason}. Safety: {safety_ratings_str}"
+        )
+
+        # Check finish reason for potential issues even if some text exists
+        if finish_reason == "SAFETY":
+            logger.error(
+                f"Gemini response flagged for SAFETY in '{context}'. Safety Ratings: {safety_ratings_str}. Content (may be partial): '{content[:100]}...'. Response: {response}"
+            )
+            raise LLMResponseError(
+                f"Gemini response blocked or cut short due to SAFETY. Ratings: {safety_ratings_str}"
+            )
+        elif finish_reason == "RECITATION":
+            logger.warning(
+                f"Gemini response flagged for RECITATION in '{context}'. Content: '{content[:100]}...'. Response: {response}"
+            )
+            # Recitation might be acceptable depending on use case, but log it.
+        elif finish_reason == "OTHER":
+            logger.warning(
+                f"Gemini response finished with OTHER reason in '{context}'. Content: '{content[:100]}...'. Response: {response}"
+            )
+            # May indicate unexpected issues.
+        elif finish_reason not in [
+            "STOP",
+            "MAX_TOKENS",
+            "UNKNOWN",
+        ]:  # Check for unexpected valid reasons
+            logger.warning(
+                f"Gemini response finished with unexpected reason '{finish_reason}' in '{context}'. Content: '{content[:100]}...'. Response: {response}"
+            )
+
+        # Check for empty content after stripping
+        if not content and finish_reason == "STOP":
+            logger.warning(
+                f"Received empty content string from Gemini API ({context}), but finish reason was 'STOP'. Response: {response}"
+            )
+            # Return empty string as it might be intentional.
+        elif not content and finish_reason != "STOP":
+            logger.error(
+                f"Received empty content string from Gemini API ({context}) with finish reason '{finish_reason}'. Response: {response}"
+            )
+            raise LLMResponseError(
+                f"Received empty content from Gemini API. Finish Reason: {finish_reason}"
+            )
+
+        return content
+
+    def _call_api(self, messages: List[Dict[str, str]]) -> str:
         """
-        if self.conversation:
-            # Start a new conversation, preserving the current system message setting
-            self._start_conversation(self.system_message)
-            # Note: _start_conversation already logs "Started new conversation..."
-            # logger.info("Conversation cleared (system message preserved).") # Redundant log
+        Internal method for stateless Gemini API calls using generate_content.
+        The public 'query' method handles choosing between this and stateful chat.
+        """
+        logger.debug(
+            f"Calling Gemini API (stateless generate_content) for model '{self.model_name}'. Translating {len(messages)} messages."
+        )
+        gemini_history = self._translate_roles_for_gemini(messages)
+
+        if not gemini_history:
+            logger.error(
+                "Cannot call Gemini API (generate_content) with empty history after role translation."
+            )
+            # Check if original messages only contained system messages
+            if all(m.get("role") == "system" for m in messages):
+                raise LLMClientError(
+                    "Cannot call Gemini API (generate_content): Input contained only system messages."
+                )
+            else:
+                raise LLMClientError(
+                    "No valid messages found for Gemini API call (generate_content) after role translation."
+                )
+
+        logger.debug(f"Calling generate_content with {len(gemini_history)} translated messages.")
+        try:
+            # Use the initialized self.model instance
+            response = self.model.generate_content(
+                contents=gemini_history,
+                # generation_config and safety_settings are part of self.model
+                stream=False,  # Use non-streaming for simple query interface
+            )
+            # Process response using the common handler
+            return self._handle_gemini_response(response, context="generate_content")
+
+        # --- Specific Google API Error Handling ---
+        except self.google_exceptions.PermissionDenied as e:
+            logger.error(f"Gemini API permission denied (generate_content): {e}")
+            raise LLMConfigurationError(
+                f"Gemini API permission denied. Check API key/permissions. Error: {e}"
+            ) from e
+        except self.google_exceptions.InvalidArgument as e:
+            # Often indicates issues with the request structure (e.g., roles, content format)
+            logger.error(f"Gemini API invalid argument (generate_content): {e}")
+            raise LLMResponseError(
+                f"Gemini API invalid argument (check message roles/format?). Error: {e}"
+            ) from e
+        except self.google_exceptions.ResourceExhausted as e:
+            logger.error(f"Gemini API resource exhausted (generate_content - rate limit?): {e}")
+            raise LLMResponseError(
+                f"Gemini API resource exhausted (likely rate limit). Error: {e}"
+            ) from e
+        except self.google_exceptions.NotFound as e:
+            # Should be caught at init, but maybe model becomes unavailable later?
+            logger.error(
+                f"Gemini API resource not found (generate_content - model '{self.model_name}'?): {e}"
+            )
+            raise LLMConfigurationError(
+                f"Gemini API resource not found (model '{self.model_name}'?). Error: {e}"
+            ) from e
+        except self.google_exceptions.InternalServerError as e:
+            logger.error(f"Gemini API internal server error (generate_content): {e}")
+            raise LLMResponseError(
+                f"Gemini API reported an internal server error. Try again later. Error: {e}"
+            ) from e
+        except self.google_exceptions.GoogleAPIError as e:  # Catch-all for other Google API errors
+            logger.error(f"Gemini API error (generate_content): {e}")
+            raise LLMResponseError(f"Gemini API returned an error: {e}") from e
+        # --- General Exceptions ---
+        except Exception as e:
+            logger.exception(
+                f"An unexpected error occurred during Gemini API call (generate_content): {e}"
+            )
+            # Attempt to get a more specific message if available
+            error_message = getattr(e, "message", str(e))
+            raise LLMClientError(
+                f"Unexpected error during Gemini API call (generate_content): {error_message}"
+            ) from e
+
+    def query(
+        self,
+        prompt: str,
+        use_conversation: bool = True,
+        conversation_history: Optional[
+            List[Dict[str, str]]
+        ] = None,  # Used only if use_conversation=False
+    ) -> str:
+        """
+        Sends a prompt to the Gemini LLM.
+
+        If use_conversation is True, it utilizes a stateful ChatSession, managing
+        history internally (translating roles as needed).
+        If use_conversation is False, it performs a stateless generate_content call
+        using the logic from the base LLMInterface.query method.
+
+        Args:
+            prompt: The user's input prompt.
+            use_conversation: If True, use stateful chat session. If False, use stateless call.
+            conversation_history: Optional history for stateless calls (ignored if use_conversation=True).
+
+        Returns:
+            The LLM's response content as a string.
+
+        Raises:
+            LLMConfigurationError: For configuration issues.
+            LLMClientError: For client-side issues.
+            LLMResponseError: For API errors or problematic responses.
+        """
+        if use_conversation:
+            # --- Stateful Chat Session ---
+            logger.debug("Using stateful Gemini chat session.")
+
+            # Initialize chat session if it doesn't exist
+            if not self.chat:
+                logger.info("Starting new Gemini chat session.")
+                # Translate existing internal history (user/assistant) to Gemini format (user/model)
+                # Use the current state of self.conversation
+                initial_gemini_history = self._translate_roles_for_gemini(
+                    self.conversation.get_messages()
+                )
+                logger.debug(
+                    f"Initializing chat with {len(initial_gemini_history)} translated messages."
+                )
+                try:
+                    # Start chat using the initialized self.model (which includes system instruction etc.)
+                    self.chat = self.model.start_chat(history=initial_gemini_history)
+                except self.google_exceptions.InvalidArgument as e:
+                    logger.error(
+                        f"Failed to start Gemini chat session due to invalid argument (check history format/roles?): {e}"
+                    )
+                    raise LLMResponseError(
+                        f"Failed to start Gemini chat session (invalid history/roles?): {e}"
+                    ) from e
+                except Exception as e:
+                    logger.exception(f"Failed to start Gemini chat session: {e}")
+                    raise LLMClientError(f"Failed to start Gemini chat session: {e}") from e
+
+            # --- Send Message via Chat ---
+            user_message_added_to_internal = False
+            try:
+                logger.debug(f"Sending message to Gemini chat: '{prompt[:100]}...'")
+                # Send the prompt using the chat session
+                response = self.chat.send_message(prompt, stream=False)
+
+                # --- Process response ---
+                content = self._handle_gemini_response(response, context="chat")
+
+                # --- Update Internal State (on success) ---
+                # Add the user prompt that was successfully sent and processed.
+                self.conversation.add_user_message(prompt)
+                user_message_added_to_internal = True  # Mark success
+                # Add the successful assistant/model response.
+                self.conversation.add_assistant_message(content)
+                logger.debug("Updated internal conversation history after successful chat message.")
+
+                # Update the chat object's history (optional, but good practice if reusing chat object elsewhere)
+                # Note: The google library might update chat.history automatically, but explicit sync can be safer
+                # self.chat.history = self._translate_roles_for_gemini(self.conversation.get_messages())
+
+                return content
+
+            # --- Error Handling for Chat Session ---
+            except (LLMClientError, LLMConfigurationError, LLMResponseError) as e:
+                # These errors are already logged by _handle_gemini_response or raised directly
+                # If the error happened *after* the user message was added internally (shouldn't happen often), log it.
+                if user_message_added_to_internal:
+                    logger.warning(
+                        "Error occurred after user message was added to internal state but before assistant response - state might be inconsistent."
+                    )
+                    # Consider removing the user message here if necessary, though it indicates partial success followed by failure.
+                # No need to pop user message here as it wasn't added on the failure path of send_message or _handle_gemini_response
+                raise  # Re-raise the specific error
+            except self.google_exceptions.PermissionDenied as e:
+                logger.error(f"Gemini API chat permission denied: {e}")
+                raise LLMConfigurationError(f"Gemini chat permission denied: {e}") from e
+            except self.google_exceptions.InvalidArgument as e:
+                logger.error(f"Gemini API chat invalid argument: {e}")
+                raise LLMResponseError(f"Gemini chat invalid argument: {e}") from e
+            except self.google_exceptions.ResourceExhausted as e:
+                logger.error(f"Gemini API chat resource exhausted (rate limit?): {e}")
+                raise LLMResponseError(f"Gemini chat resource exhausted: {e}") from e
+            except self.google_exceptions.InternalServerError as e:
+                logger.error(f"Gemini API internal server error (chat): {e}")
+                raise LLMResponseError(
+                    f"Gemini API reported an internal server error during chat. Try again later. Error: {e}"
+                ) from e
+            except (
+                self.google_exceptions.GoogleAPIError
+            ) as e:  # Catch-all Google API errors for chat
+                logger.error(f"Gemini API chat error: {e}")
+                raise LLMResponseError(f"Gemini chat API returned an error: {e}") from e
+            except Exception as e:
+                logger.exception(
+                    f"An unexpected error occurred during Gemini chat session send_message: {e}"
+                )
+                error_message = getattr(e, "message", str(e))
+                # Don't modify internal conversation state here, as failure happened during API call
+                raise LLMClientError(
+                    f"Unexpected error during Gemini chat session: {error_message}"
+                ) from e
+
         else:
-            logger.info("Attempted to clear conversation, but none exists.")
+            # --- Stateless Call ---
+            logger.debug("Using stateless Gemini API call (generate_content via base class query).")
+            # Delegate to the base class query method, which will call our _call_api (stateless version)
+            return super().query(
+                prompt, use_conversation=False, conversation_history=conversation_history
+            )
+
+    def clear_conversation(self, keep_system: bool = True):
+        """Clears the internal conversation history and resets the chat session."""
+        super().clear_conversation(keep_system=keep_system)
+        # Also reset the stateful chat session object
+        if self.chat:
+            logger.debug("Resetting Gemini chat session object.")
+            self.chat = None
+
+    def set_system_message(self, message: Optional[str]):
+        """Sets the system message and re-initializes the underlying Gemini model if needed."""
+        if message != self._system_message:
+            logger.info(f"System message changed for Gemini. Re-initializing GenerativeModel.")
+            super().set_system_message(message)  # Update internal state and conversation object
+            try:
+                # Re-initialize the model with the new system instruction
+                self.model = self.genai.GenerativeModel(
+                    model_name=self.model_name,
+                    generation_config=self.generation_config,
+                    safety_settings=self.safety_settings,
+                    system_instruction=self._system_message if self._system_message else None,
+                )
+                # Reset any existing chat session as its context is now based on the old system message
+                self.chat = None
+                logger.info(f"Gemini GenerativeModel re-initialized with new system instruction.")
+            except Exception as e:
+                # Log error but try to continue, state might be inconsistent
+                logger.exception(
+                    f"Failed to re-initialize Gemini GenerativeModel after system message change: {e}"
+                )
+                # Raise config error as the client might be unusable
+                raise LLMConfigurationError(
+                    f"Failed to re-initialize Gemini model after system message change: {e}"
+                ) from e
+        else:
+            logger.debug("System message unchanged for Gemini.")
+
+
+# --- Factory Function ---
+
+_PROVIDER_MAP = {
+    "openai": OpenAILLM,
+    "anthropic": AnthropicLLM,
+    "gemini": GeminiLLM,
+    # Add aliases if needed
+    "gpt": OpenAILLM,
+    "claude": AnthropicLLM,
+    "google": GeminiLLM,
+}
+
+
+def create_llm_client(
+    client_type: str,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,  # If None, provider class will use its default
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    system_message: Optional[str] = None,
+    role_name: Optional[str] = None,
+) -> LLMInterface:
+    """
+    Factory function to create LLM client instances based on type.
+
+    Args:
+        client_type: The type of client ('openai', 'anthropic', 'gemini', or aliases).
+        api_key: The API key (optional, will check environment variables).
+        model: The specific model name (optional, uses provider default if None).
+        temperature: The generation temperature.
+        max_tokens: The maximum number of tokens to generate.
+        system_message: The initial system message/instruction.
+        role_name: An optional cosmetic name for the assistant role.
+
+    Returns:
+        An instance of a class implementing LLMInterface.
+
+    Raises:
+        LLMConfigurationError: If client_type is unsupported or initialization fails due to config.
+        LLMClientError: For other unexpected errors during creation.
+    """
+
+    client_type_lower = client_type.lower()
+    logger.info(f"Attempting to create LLM client of type: '{client_type_lower}'")
+
+    provider_class = _PROVIDER_MAP.get(client_type_lower)
+
+    if not provider_class:
+        supported = list(_PROVIDER_MAP.keys())
+        raise LLMConfigurationError(
+            f"Unsupported LLM client type: '{client_type}'. Supported types: {supported}."
+        )
+
+    try:
+        # Prepare arguments, letting None be passed if model is not specified
+        # The provider class __init__ will handle default model logic
+        client_args = {
+            "api_key": api_key,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "system_message": system_message,
+            "role_name": role_name,
+        }
+        if model:
+            client_args["model"] = model
+
+        # Instantiate the chosen provider class
+        instance = provider_class(**client_args)
+        logger.info(f"Successfully created LLM client instance: {provider_class.__name__}")
+        return instance
+
+    except LLMConfigurationError as e:
+        # Catch config errors during specific client init and re-raise
+        logger.error(f"Configuration error creating LLM client '{client_type}': {e}")
+        raise
+    except LLMClientError as e:
+        # Catch other client errors during init
+        logger.error(f"Client error creating LLM client '{client_type}': {e}")
+        raise
+    except Exception as e:
+        # Catch any other unexpected errors during client creation
+        logger.exception(f"Unexpected error creating LLM client '{client_type}': {e}")
+        # Wrap in LLMClientError for consistency
+        raise LLMClientError(
+            f"An unexpected error occurred while creating LLM client '{client_type}': {e}"
+        ) from e
+
+
+# --- Example Usage (Optional) ---
+if __name__ == "__main__":
+    # This block runs only when the script is executed directly
+    # Requires environment variables (e.g., OPENAI_API_KEY) to be set
+
+    print("Running LLM Client Example...")
+    logger.setLevel(logging.DEBUG)  # Show debug messages for example
+    logging.basicConfig(level=logging.DEBUG)  # Configure root logger for dependencies
+
+    try:
+        # --- OpenAI Example ---
+        print("\n--- OpenAI Example ---")
+        try:
+            openai_client = create_llm_client(
+                "openai", system_message="You are a concise assistant."
+            )
+            # Stateless query
+            response_stateless = openai_client.query(
+                "What is the capital of France?", use_conversation=False
+            )
+            print(f"OpenAI Stateless Response: {response_stateless}")
+            # Stateful query
+            response1 = openai_client.query("What is Python?")
+            print(f"OpenAI Response 1: {response1}")
+            response2 = openai_client.query("What are its main uses?")
+            print(f"OpenAI Response 2: {response2}")
+            print("OpenAI Conversation History:")
+            for msg in openai_client.get_conversation_history():
+                print(f"  {msg['role']}: {msg['content'][:80]}...")
+            openai_client.clear_conversation()
+            print("OpenAI Conversation Cleared.")
+        except LLMConfigurationError as e:
+            print(f"OpenAI Configuration Error: {e}")
+        except (LLMClientError, LLMResponseError) as e:
+            print(f"OpenAI Client/Response Error: {e}")
+
+        # --- Anthropic Example ---
+        print("\n--- Anthropic Example ---")
+        try:
+            # Ensure ANTHROPIC_API_KEY is set in env
+            anthropic_client = create_llm_client(
+                "anthropic",
+                model="claude-3-haiku-20240307",
+                system_message="Respond like a pirate.",
+            )
+            response1 = anthropic_client.query("Why is the sky blue?")
+            print(f"Anthropic Response 1: {response1}")
+            response2 = anthropic_client.query("Tell me a short joke about the sea.")
+            print(f"Anthropic Response 2: {response2}")
+            print("Anthropic Conversation History:")
+            for msg in anthropic_client.get_conversation_history():
+                print(f"  {msg['role']}: {msg['content'][:80]}...")
+            anthropic_client.clear_conversation(keep_system=False)  # Clear system too
+            print("Anthropic Conversation Cleared (including system).")
+            # Query again without system message
+            response3 = anthropic_client.query("What is water?")
+            print(f"Anthropic Response 3 (no system): {response3}")
+        except LLMConfigurationError as e:
+            print(f"Anthropic Configuration Error: {e}")
+        except (LLMClientError, LLMResponseError) as e:
+            print(f"Anthropic Client/Response Error: {e}")
+
+        # --- Gemini Example ---
+        print("\n--- Gemini Example ---")
+        try:
+            # Ensure GOOGLE_API_KEY is set in env
+            gemini_client = create_llm_client(
+                "gemini", system_message="Explain things simply, like I'm five."
+            )
+            response1 = gemini_client.query("How does a car engine work?")
+            print(f"Gemini Response 1: {response1}")
+            response2 = gemini_client.query("Why do we need fuel?")
+            print(f"Gemini Response 2: {response2}")
+            print("Gemini Conversation History (Internal):")
+            for msg in gemini_client.get_conversation_history():
+                print(f"  {msg['role']}: {msg['content'][:80]}...")
+            # Test changing system message
+            gemini_client.set_system_message("Explain like a rocket scientist.")
+            response3 = gemini_client.query(
+                "How does gravity work?"
+            )  # Should start new chat context
+            print(f"Gemini Response 3 (new system msg): {response3}")
+            gemini_client.clear_conversation()
+            print("Gemini Conversation Cleared.")
+        except LLMConfigurationError as e:
+            print(f"Gemini Configuration Error: {e}")
+        except (LLMClientError, LLMResponseError) as e:
+            print(f"Gemini Client/Response Error: {e}")
+
+    except Exception as e:
+        print(f"\nAn unexpected error occurred during the example: {e}")

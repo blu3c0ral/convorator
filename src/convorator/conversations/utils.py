@@ -7,13 +7,7 @@ from typing import Any, Callable, Dict, Optional, TypeVar, Union, get_args, get_
 import jsonschema
 
 from convorator.conversations.conversation_setup import LLMResponseError, SchemaValidationError
-
-
-# Define a custom exception for missing variables in locals
-class MissingVariableError(Exception):
-    """Exception raised when a required variable is missing in locals."""
-
-    pass
+from convorator.exceptions import MissingVariableError
 
 
 def validate_json(logger: logging.Logger, data: Dict, schema: Dict) -> str:
