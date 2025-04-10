@@ -1,74 +1,87 @@
-# conversation_orchestrator.py
+# src/convorator/conversations/conversation_orchestrator.py
 
 """
-Multi-LLM Orchestration Framework for Solution Improvement
+Multi-LLM Orchestration Framework for Collaborative Solution Improvement
 
-This module implements a sophisticated orchestration system for conducting moderated
-debates between multiple LLMs to incrementally improve solutions through structured
-critique, analysis, and refinement.
+This module implements a comprehensive orchestration system that leverages multiple
+Large Language Models (LLMs) in distinct roles to collaboratively refine and improve
+solutions through structured debate, analysis, and iterative enhancement.
 
-Key Components:
----------------
-1. JSON Validation & Parsing:
-   - Robust parsing of LLM-generated JSON with schema validation
-   - Error recovery and correction mechanisms
+Architecture Overview:
+---------------------
+The orchestrator employs a multi-agent framework where each LLM plays a specialized role:
 
-2. LLM Conversation Management:
-   - Stateful conversation tracking with role management
-   - Turn-taking coordination between multiple LLM participants
+1. Primary Agent: Responsible for proposing initial solutions and refinements during the debate.
+2. Debater Agent: Critiques proposals, identifies weaknesses, and suggests alternatives during the debate.
+3. Moderator Agent: Guides the discussion, evaluates arguments, and synthesizes feedback from the debate.
+4. Solution Generation Agent: Constructs the final, improved solution based on the debate summary and requirements.
 
-3. Moderated Debate System:
-   - Three-role framework (Primary, Debater, Moderator)
-   - Structured feedback loops for continuous improvement
+The solution improvement process follows a structured workflow:
 
-4. Solution Generation & Verification:
-   - Schema-driven solution validation
-   - Iterative refinement with error correction
+1. Initial Setup: Configuration, loading LLMs, preparing initial inputs.
+2. Moderated Debate: Multi-turn discussion between the Primary and Debater agents,
+   with the Moderator providing guidance and evaluation based on assessment criteria.
+3. Summary Synthesis: The Moderator consolidates insights and key feedback from the debate.
+4. Solution Generation: The Solution Generation Agent creates an improved solution incorporating the debate summary.
+5. Verification & Correction: The generated solution is validated against schema requirements.
+   If validation fails, the orchestrator attempts correction by feeding errors back to the Solution Generation Agent.
 
-Core Functions:
---------------
-- generate_and_verify_result: Produces schema-compliant outputs with retry logic
-- llms_conversation: Manages two-party LLM interactions with turn coordination
-- moderated_conversation: Orchestrates three-party debates with moderation
-- moderated_solution_improvement: End-to-end solution refinement pipeline
-- parse_json_response: Extracts and validates JSON from LLM outputs
-
-Usage Patterns:
---------------
-This module is typically used with configuration objects from gen_conversations_helpers.py
-to create parameterized improvement pipelines. The most common entry point is
-the moderated_solution_improvement function or the improve_solution_with_moderation
-wrapper.
-
-Dependencies:
+Key Features:
 ------------
-- jsonschema: For JSON validation
-- src.utils.gen_conversations_helpers: For configuration classes
-- src.utils.llm_client: For LLM interface and conversation management
+1. Stateful Conversation Management:
+   - Maintains separate conversation contexts for each agent during the debate.
+   - Coordinates turns and ensures proper information flow between agents.
+   - Tracks the overall conversation history for context and logging.
+
+2. Robust Error Handling & Verification:
+   - Schema validation for JSON outputs with descriptive error messages.
+   - Automatic retry loop for solution generation with intelligent error correction feedback.
+   - Token limit awareness and automatic history truncation to prevent API errors.
+
+3. Configurable Orchestration:
+   - Customizable prompt generation logic via pluggable builder functions.
+   - Adjustable iteration counts for both the debate and the solution improvement/correction loop.
+   - Flexible LLM assignment to different roles.
+
+4. Schema-Driven Solution Refinement:
+   - Ensures final output adheres to a specified JSON schema (if provided).
+   - Focuses the improvement process on meeting structural and content requirements.
+
+Implementation Details:
+---------------------
+The core of the system is the SolutionImprovementOrchestrator class, which:
+
+1. Manages the multi-step workflow through its `run()` method.
+2. Coordinates the debate phase via `_run_moderated_debate()`.
+3. Handles individual agent turns using the `_execute_agent_turn()` helper.
+4. Generates and iteratively corrects the final solution via `_generate_and_verify_result()`.
+
+The orchestrator maintains conversation state separately for each agent involved in the
+debate, allowing them distinct perspectives while tracking the unified conversation flow.
+Error recovery in `_generate_and_verify_result()` is crucial, providing specific error
+details back to the Solution Generation Agent to guide the correction attempts.
+
+Usage:
+-----
+The primary entry point is the `improve_solution_with_moderation()` function, which accepts:
+- A configuration object (`OrchestratorConfig`) detailing LLMs, iterations, etc.
+- An initial solution (string or dictionary).
+- Requirements the final solution must meet.
+- Assessment criteria to guide the debate phase.
 
 Example:
--------
 ```python
-# Assuming setup is done as in the example in conversation_setup.py
-from conversation_orchestrator import moderated_solution_improvement, improve_solution_with_moderation
-from conversation_setup import (
-    ModeratedSolutionImprovementConfig, SolutionPacketConfig,
-    ModeratedConversationConfig, SolutionLLMGroup, LLMInterface,
-    default_create_initial_prompt, default_synthesize_moderation_summary,
-    default_build_solution_improvement_prompt, default_moderator_context_builder
-)
-import logging
+from convorator.conversations.conversation_orchestrator import improve_solution_with_moderation
+from convorator.conversations.configurations import OrchestratorConfig
+from convorator.client.llm_client import LLMInterface
 
-# Setup logger
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+# 1. Configure LLMs for each role
+primary_llm = LLMInterface(...) # E.g., model tuned for generation
+debater_llm = LLMInterface(...) # E.g., model tuned for critique
+moderator_llm = LLMInterface(...) # E.g., model tuned for summarization/evaluation
+solution_llm = LLMInterface(...) # E.g., model tuned for final generation/correction
 
-# Configure LLMs (using placeholder)
-primary_llm = LLMInterface()
-debater_llm = LLMInterface()
-moderator_llm = LLMInterface()
-solution_llm = LLMInterface()
-
+# 2. Group LLMs
 llm_group = SolutionLLMGroup(
     primary_llm=primary_llm,
     debater_llm=debater_llm,
@@ -76,33 +89,45 @@ llm_group = SolutionLLMGroup(
     solution_generation_llm=solution_llm
 )
 
-solution_packet_config = SolutionPacketConfig(
+# 3. Create Orchestrator Configuration
+config = OrchestratorConfig(
     llm_group=llm_group,
-    logger=logger,
-    debate_iterations=2,
+    topic="Improve Product Description",
+    requirements=requirements,
+    assessment_criteria=assessment_criteria,
+    debate_iterations=3,
     improvement_iterations=2
+    # Add other configurations like custom prompt builders or schema if needed
 )
 
-moderated_conversation_config = ModeratedConversationConfig()
+# 4. Define the task
+initial_solution = {'product_id': 123, 'status': 'draft'}
+requirements = "The final solution must be a JSON object containing 'product_id' (int), 'status' (string: 'active' or 'inactive'), and 'description' (string, max 100 chars)."
+assessment_criteria = "Focus on correctness of status and conciseness/relevance of description."
 
-config = ModeratedSolutionImprovementConfig(
-    solution_packet_config=solution_packet_config,
-    moderated_conversation_config=moderated_conversation_config,
-    initial_solution='{"key": "initial_value"}',
-    requirements="Must be a valid JSON object with 'key' and 'improved_key'.",
-    assessment_criteria="Accuracy and adherence to requirements.",
-    # Add other optional parameters like custom prompt functions if needed
-)
-
+# 5. Run the improvement process
 try:
-    improved_solution = improve_solution_with_moderation(config)
-    print(f"Improved Solution: {improved_solution}")
+    improved_solution = improve_solution_with_moderation(
+        config=config,
+        initial_solution=initial_solution,
+        requirements=requirements,
+        assessment_criteria=assessment_criteria
+    )
+    print("Successfully generated improved solution:", improved_solution)
 except Exception as e:
-    logger.error(f"Orchestration failed: {e}", exc_info=True)
+    print(f"Orchestration failed: {e}")
+
 ```
 
-TODO: Async Support
-TODO: Token Limit Awareness
+Dependencies:
+------------
+- jsonschema: For JSON schema validation.
+- convorator.exceptions: For specialized exception types.
+- convorator.client.llm_client: For LLM communication and conversation management.
+- convorator.conversations.configurations: For orchestration configuration (`OrchestratorConfig`).
+- convorator.conversations.state: For conversation state management (`MultiAgentConversation`).
+- convorator.conversations.prompts: For default prompt builders and input structure (`PromptBuilderInputs`).
+- convorator.conversations.utils: For utility functions like JSON parsing (`parse_json_response`).
 """
 
 import json
@@ -116,6 +141,8 @@ from convorator.exceptions import (
     LLMResponseError,
     MaxIterationsExceededError,
     SchemaValidationError,
+    LLMClientError,
+    LLMConfigurationError,
 )
 from convorator.client.llm_client import Conversation, LLMInterface, Message
 
@@ -130,6 +157,9 @@ from convorator.conversations.configurations import OrchestratorConfig
 
 # Import the conversation state class
 from convorator.conversations.state import MultiAgentConversation
+
+# Import shared types
+from convorator.conversations.types import SolutionLLMGroup
 
 # Import prompt builders and the container class
 from convorator.conversations.prompts import (
@@ -219,11 +249,22 @@ class SolutionImprovementOrchestrator:
         # Directly access fields from OrchestratorConfig
         self.llm_group = config.llm_group
         self.logger = config.logger
-        self.prompt_builders = config.prompt_builders  # Already aligned
+        # self.prompt_builders = config.prompt_builders  # Already aligned - REMOVED
         self.debate_iterations = config.debate_iterations
         self.improvement_iterations = config.improvement_iterations
-        self.moderator_instructions = config.moderator_instructions
-        self.debate_context = config.debate_context  # Added field
+        # Get moderator instructions and context
+        self.moderator_instructions = config.moderator_instructions_override
+        self.debate_context = config.debate_context_override
+        # Access individual prompt builder functions directly from config
+        self.build_initial_prompt = config.build_initial_prompt
+        self.build_debate_user_prompt = config.build_debate_user_prompt
+        self.build_moderator_context = config.build_moderator_context
+        self.build_moderator_role_instructions = config.build_moderator_role_instructions
+        self.build_primary_prompt = config.build_primary_prompt
+        self.build_debater_prompt = config.build_debater_prompt
+        self.build_summary_prompt = config.build_summary_prompt
+        self.build_improvement_prompt = config.build_improvement_prompt
+        self.build_fix_prompt = config.build_fix_prompt
 
         # Store task-specific inputs directly
         self.initial_solution = initial_solution
@@ -327,7 +368,7 @@ class SolutionImprovementOrchestrator:
                 "Prompt inputs not prepared before building initial prompt."
             )
 
-        builder = self.prompt_builders.build_initial_prompt or default_build_initial_prompt
+        builder = self.build_initial_prompt or default_build_initial_prompt
         try:
             content = builder(self.prompt_inputs)
             self.prompt_inputs.initial_prompt_content = content  # Store for later use
@@ -359,6 +400,10 @@ class SolutionImprovementOrchestrator:
         moderator_conversation = Conversation(
             system_message=self.moderator_llm.get_system_message()
         )
+        # Assign to instance attributes to fix the bug
+        self.primary_conv = primary_conversation
+        self.debater_conv = debater_conversation
+        self.moderator_conv = moderator_conversation
 
         # Reset main log for this debate run
         self.main_conversation_log = MultiAgentConversation()
@@ -367,9 +412,7 @@ class SolutionImprovementOrchestrator:
         )  # Ensure prompt inputs uses the current log
 
         # --- Initial User Prompt Setup ---
-        user_prompt_builder = (
-            self.prompt_builders.build_debate_user_prompt or default_build_debate_user_prompt
-        )
+        user_prompt_builder = self.build_debate_user_prompt or default_build_debate_user_prompt
         try:
             enhanced_prompt = user_prompt_builder(self.prompt_inputs)
         except Exception as e:
@@ -384,7 +427,7 @@ class SolutionImprovementOrchestrator:
         # --- Debate Execution ---
         try:
             last_debater_response = self._run_initial_debater_turn(
-                enhanced_prompt, debater_conversation, primary_conversation, moderator_conversation
+                enhanced_prompt, self.debater_conv, self.primary_conv, self.moderator_conv
             )
             previous_moderator_feedback = None  # Feedback from the *previous* round for Primary
 
@@ -394,24 +437,10 @@ class SolutionImprovementOrchestrator:
                 self.logger.info(f"Starting Round {round_num}/{self.debate_iterations}.")
 
                 # Primary Turn
-                last_primary_response = self._run_primary_turn(
-                    round_num,
-                    last_debater_response,
-                    previous_moderator_feedback,
-                    primary_conversation,
-                    debater_conversation,
-                    moderator_conversation,
-                )
+                last_primary_response = self._run_primary_turn(round_num)
 
                 # Moderator Turn
-                current_moderator_feedback = self._run_moderator_turn(
-                    round_num,
-                    last_primary_response,
-                    last_debater_response,
-                    moderator_conversation,
-                    primary_conversation,
-                    debater_conversation,
-                )
+                current_moderator_feedback = self._run_moderator_turn(round_num)
                 # Store feedback for the *next* primary turn
                 previous_moderator_feedback = current_moderator_feedback
 
@@ -423,15 +452,7 @@ class SolutionImprovementOrchestrator:
                     break
 
                 # Debater Turn (with Feedback)
-                last_debater_response = self._run_debater_turn_with_feedback(
-                    round_num,
-                    last_primary_response,
-                    current_moderator_feedback,
-                    last_debater_response,  # Pass previous debater response for context
-                    debater_conversation,
-                    primary_conversation,
-                    moderator_conversation,
-                )
+                last_debater_response = self._run_debater_turn(round_num)
 
             self.logger.info("Moderated debate phase completed.")
             return self.main_conversation_log.get_messages()
@@ -452,118 +473,100 @@ class SolutionImprovementOrchestrator:
         # Use empty prompt content as it's now in history
         response = self._query_agent_and_update_logs(
             llm_to_query=self.debater_llm,
-            prompt_content="",
             role_name=self.debater_name,
             conversation_history=debater_conv,
             other_conversations_history=list(other_convs),
         )
         return response
 
-    def _run_primary_turn(
-        self,
-        round_num: int,
-        last_debater_response: str,
-        previous_moderator_feedback: Optional[str],
-        primary_conv: Conversation,
-        *other_convs: Conversation,
-    ) -> str:
-        """Handles the Primary agent's turn."""
+    def _run_primary_turn(self, round_num: int) -> str:
+        """Executes one turn of the Primary agent."""
         self.logger.debug(f"Round {round_num}: Getting {self.primary_name} response.")
 
-        # Need primary's *own* previous response for context in the prompt builder
-        primary_msgs = self.main_conversation_log.get_messages_by_role(self.primary_name)
-        last_primary_response_content = primary_msgs[-1]["content"] if primary_msgs else None
-
-        # Build prompt using the dedicated builder
-        builder = self.prompt_builders.build_primary_prompt or default_build_primary_prompt
-        try:
-            # Update dynamic prompt inputs (if builder uses them, though defaults rely on history)
-            # self.prompt_inputs.last_debater_response = last_debater_response # Example if needed
-
-            primary_prompt = builder(self.prompt_inputs)  # Pass the stateful input object
-        except Exception as e:
-            self.logger.error(f"Failed to build primary prompt: {e}", exc_info=True)
-            raise LLMOrchestrationError(f"Failed to build primary prompt: {e}") from e
-
-        primary_conv.add_user_message(primary_prompt)  # Add the *built* prompt to agent history
-        response = self._query_agent_and_update_logs(
-            llm_to_query=self.primary_llm,
-            prompt_content="",  # Handled by history
+        return self._execute_agent_turn(
             role_name=self.primary_name,
-            conversation_history=primary_conv,
-            other_conversations_history=list(other_convs),
+            llm=self.primary_llm,
+            prompt_builder=self.build_primary_prompt,
+            agent_conv=self.primary_conv,
+            other_convs=[self.debater_conv, self.moderator_conv],
         )
-        return response
 
-    def _run_moderator_turn(
-        self,
-        round_num: int,
-        last_primary_response: str,
-        last_debater_response: str,
-        moderator_conv: Conversation,
-        *other_convs: Conversation,
-    ) -> str:
-        """Handles the Moderator agent's assessment turn."""
-        self.logger.debug(f"Round {round_num}: Getting {self.moderator_name} feedback.")
+    def _run_moderator_turn(self, round_num: int) -> str:
+        """Executes one turn of the Moderator agent."""
+        self.logger.debug(f"Round {round_num}: Getting {self.moderator_name} response.")
 
         # Ensure moderator instructions are set (use default if necessary)
         mod_instructions = self._get_moderator_instructions()
         self.prompt_inputs.moderator_instructions = mod_instructions  # Update inputs object
 
-        # Build context using the dedicated builder
-        builder = self.prompt_builders.build_moderator_context or default_build_moderator_context
-        try:
-            # Update dynamic prompt inputs (if builder uses them, though defaults rely on history)
-            # self.prompt_inputs.last_primary_response = last_primary_response # Example if needed
-
-            moderator_context = builder(self.prompt_inputs)
-        except Exception as e:
-            self.logger.error(f"Failed to build moderator context: {e}", exc_info=True)
-            raise LLMOrchestrationError(f"Failed to build moderator context: {e}") from e
-
-        moderator_conv.add_user_message(moderator_context)  # Add *built* context to agent history
-        response = self._query_agent_and_update_logs(
-            llm_to_query=self.moderator_llm,
-            prompt_content="",  # Handled by history
+        return self._execute_agent_turn(
             role_name=self.moderator_name,
-            conversation_history=moderator_conv,
-            other_conversations_history=list(other_convs),
-        )
-        return response
-
-    def _run_debater_turn_with_feedback(
-        self,
-        round_num: int,
-        last_primary_response: str,
-        current_moderator_feedback: str,
-        last_debater_response: Optional[str],
-        debater_conv: Conversation,
-        *other_convs: Conversation,
-    ) -> str:
-        """Handles the Debater agent's turn, incorporating moderator feedback."""
-        self.logger.debug(
-            f"Round {round_num}: Getting {self.debater_name} response (with feedback)."
+            llm=self.moderator_llm,
+            prompt_builder=self.build_moderator_context,
+            agent_conv=self.moderator_conv,
+            other_convs=[self.primary_conv, self.debater_conv],
         )
 
-        # Build prompt using the dedicated builder
-        builder = self.prompt_builders.build_debater_prompt or default_build_debater_prompt
-        try:
-            # Update dynamic prompt inputs (if builder uses them)
-            # self.prompt_inputs.last_primary_response = last_primary_response # Example if needed
-            # self.prompt_inputs.current_moderator_feedback = current_moderator_feedback # Example if needed
+    def _run_debater_turn(self, round_num: int) -> str:
+        """Executes one turn of the Debater agent."""
+        self.logger.debug(f"Round {round_num}: Getting {self.debater_name} response.")
 
-            debater_prompt = builder(self.prompt_inputs)  # Pass stateful object
-        except Exception as e:
-            self.logger.error(f"Failed to build debater prompt with feedback: {e}", exc_info=True)
-            raise LLMOrchestrationError(f"Failed to build debater prompt with feedback: {e}") from e
-
-        debater_conv.add_user_message(debater_prompt)  # Add *built* prompt to agent history
-        response = self._query_agent_and_update_logs(
-            llm_to_query=self.debater_llm,
-            prompt_content="",  # Handled by history
+        return self._execute_agent_turn(
             role_name=self.debater_name,
-            conversation_history=debater_conv,
-            other_conversations_history=list(other_convs),
+            llm=self.debater_llm,
+            prompt_builder=self.build_debater_prompt,
+            agent_conv=self.debater_conv,
+            other_convs=[self.primary_conv, self.moderator_conv],
+        )
+
+    def _execute_agent_turn(
+        self,
+        role_name: str,
+        llm: LLMInterface,
+        prompt_builder: Callable[[PromptBuilderInputs], str],
+        agent_conv: Conversation,
+        other_convs: List[Conversation],
+    ) -> str:
+        """
+        Executes a single turn for an agent: builds prompt, adds to history, queries, updates logs.
+
+        Args:
+            role_name: The name of the role executing the turn.
+            llm: The LLMInterface for the agent.
+            prompt_builder: The function to build the prompt content.
+            agent_conv: The Conversation object for the agent.
+            other_convs: List of Conversation objects for other agents.
+
+        Returns:
+            The content of the LLM response.
+
+        Raises:
+            LLMOrchestrationError: If prompt building fails.
+            LLMResponseError: If the LLM query fails.
+        """
+        if not self.prompt_inputs:
+            # This should ideally not happen if run() is called first
+            raise LLMOrchestrationError(
+                "Prompt inputs not initialized before executing agent turn."
+            )
+
+        # Build the prompt using the dedicated builder
+        try:
+            prompt_content = prompt_builder(self.prompt_inputs)
+            self.logger.debug(f"Built prompt for {role_name}: {prompt_content[:100]}...")
+        except Exception as e:
+            self.logger.error(f"Failed to build prompt for {role_name}: {e}", exc_info=True)
+            raise LLMOrchestrationError(f"Failed to build prompt for {role_name}: {e}") from e
+
+        # Add the *built* prompt to the agent's perspective history
+        agent_conv.add_user_message(prompt_content)
+
+        # Query the agent and update all relevant logs
+        response = self._query_agent_and_update_logs(
+            llm_to_query=llm,
+            role_name=role_name,
+            conversation_history=agent_conv,
+            other_conversations_history=other_convs,
         )
         return response
 
@@ -573,10 +576,7 @@ class SolutionImprovementOrchestrator:
             return self.moderator_instructions
 
         self.logger.debug("No moderator instructions provided, generating default.")
-        builder = (
-            self.prompt_builders.build_moderator_instructions
-            or default_build_moderator_instructions
-        )
+        builder = self.build_moderator_role_instructions or default_build_moderator_instructions
         try:
             return builder(self.prompt_inputs)
         except Exception as e:
@@ -592,7 +592,7 @@ class SolutionImprovementOrchestrator:
             raise LLMOrchestrationError("Prompt inputs not prepared before synthesizing summary.")
 
         # Build the prompt *for* the summary
-        builder = self.prompt_builders.build_summary_prompt or default_build_summary_prompt
+        builder = self.build_summary_prompt or default_build_summary_prompt
         try:
             # Pass the *actual* debate history to the builder if it needs it
             # Note: The default builder doesn't directly use history content in the prompt string itself,
@@ -605,12 +605,23 @@ class SolutionImprovementOrchestrator:
 
         self.logger.debug("Querying moderator LLM for summary.")
         try:
-            # Query the moderator LLM with the *history* plus the *summary prompt*
+            # Prepare history + prompt for the summary call
+            full_history_for_summary = debate_history + [
+                {"role": "user", "content": summary_prompt}
+            ]
+
+            # Prepare history, handling token limits
+            messages_to_send = self._prepare_history_for_llm(
+                llm_service=self.moderator_llm,
+                messages=full_history_for_summary,
+                context="Moderator Summary Synthesis",
+            )
+
+            # Query the moderator LLM with the prepared history
             summary = self.moderator_llm.query(
                 prompt="",  # Prompt is part of the history
                 use_conversation=False,  # Use explicit history
-                # Ensure history includes system messages if the LLM expects them for context
-                conversation_history=debate_history + [{"role": "user", "content": summary_prompt}],
+                conversation_history=messages_to_send,
                 # Add other query params if needed from config
             )
             self.logger.debug(f"Moderation summary received: {summary[:200]}...")
@@ -635,7 +646,7 @@ class SolutionImprovementOrchestrator:
 
         self.prompt_inputs.moderator_summary = moderator_summary  # Ensure it's set
 
-        builder = self.prompt_builders.build_improvement_prompt or default_build_improvement_prompt
+        builder = self.build_improvement_prompt or default_build_improvement_prompt
         try:
             prompt = builder(self.prompt_inputs)
             self.logger.debug(f"Improvement prompt created: {prompt[:200]}...")
@@ -655,7 +666,7 @@ class SolutionImprovementOrchestrator:
             )
 
         # Determine the correct fix prompt builder
-        fix_builder = self.prompt_builders.build_fix_prompt or default_build_fix_prompt
+        fix_builder = self.build_fix_prompt or default_build_fix_prompt
 
         try:
             # Use the generalized generate_and_verify method
@@ -684,10 +695,110 @@ class SolutionImprovementOrchestrator:
 
     # --- Helper Methods (Previously standalone functions) ---
 
+    def _prepare_history_for_llm(
+        self,
+        llm_service: LLMInterface,
+        messages: List[Dict[str, str]],
+        context: str = "LLM Query",
+    ) -> List[Dict[str, str]]:
+        """
+        Prepares a list of messages for an LLM call, ensuring it fits within the context limit.
+
+        Args:
+            llm_service: The LLMInterface instance being used.
+            messages: The list of messages (dictionaries) intended for the LLM.
+            context: A string describing the context for logging purposes.
+
+        Returns:
+            The potentially truncated list of messages ready for the API call.
+
+        Raises:
+            LLMOrchestrationError: If token counting fails unexpectedly.
+        """
+        try:
+            max_limit = llm_service.get_context_limit()
+            response_buffer = llm_service.max_tokens + 10
+
+            system_message = None
+            history_messages = list(messages)  # Work on a copy
+            if history_messages and history_messages[0].get("role") == "system":
+                system_message = history_messages.pop(0)
+
+            current_history_tokens = sum(
+                llm_service.count_tokens(msg.get("content", "")) for msg in history_messages
+            )
+            system_tokens = (
+                llm_service.count_tokens(system_message.get("content", "")) if system_message else 0
+            )
+            total_tokens_with_buffer = current_history_tokens + system_tokens + response_buffer
+
+            if total_tokens_with_buffer <= max_limit:
+                self.logger.debug(
+                    f"[{context}] History size ({current_history_tokens + system_tokens} tokens) + buffer ({response_buffer}) fits within limit ({max_limit}). No truncation needed."
+                )
+                return messages  # Return original if no truncation needed
+
+            self.logger.warning(
+                f"[{context}] History size ({current_history_tokens + system_tokens} tokens) + buffer ({response_buffer}) exceeds limit ({max_limit}). Truncation required."
+            )
+
+            # Check if system message + buffer alone exceeds limit
+            if system_tokens + response_buffer > max_limit and system_message:
+                self.logger.error(
+                    f"[{context}] System message ({system_tokens} tokens) + buffer ({response_buffer}) alone exceeds limit ({max_limit}). Cannot proceed."
+                )
+                raise LLMOrchestrationError(
+                    f"[{context}] System message ({system_tokens} tokens) + buffer ({response_buffer}) exceeds limit ({max_limit})."
+                )
+
+            removed_count = 0
+            removed_tokens_count = 0
+            # Loop while the current history + system + buffer is too large
+            while (
+                current_history_tokens + system_tokens + response_buffer > max_limit
+                and history_messages
+            ):
+                msg_to_remove = history_messages.pop(0)  # Remove oldest message from history
+                tokens_removed = llm_service.count_tokens(msg_to_remove.get("content", ""))
+                current_history_tokens -= tokens_removed  # Decrement history token count
+                removed_count += 1
+                removed_tokens_count += tokens_removed
+                self.logger.debug(
+                    f"[{context}] Truncating: Removed message '{msg_to_remove.get('role')}' ({tokens_removed} tokens). Remaining history tokens: {current_history_tokens}"
+                )
+
+            # After loop, check if the remaining history + system + buffer fits
+            if current_history_tokens + system_tokens + response_buffer > max_limit:
+                # This check is crucial. It catches cases where the loop finished because
+                # history_messages became empty, but the remaining (potentially just system message)
+                # still exceeds the limit, OR if the last message couldn't be removed and still violates the limit.
+                self.logger.error(
+                    f"[{context}] Truncation failed! Final history tokens ({current_history_tokens}) + system tokens ({system_tokens}) + buffer ({response_buffer}) still exceed limit ({max_limit})."
+                )
+                raise LLMOrchestrationError(
+                    f"[{context}] Failed to truncate history sufficiently. Remaining tokens ({current_history_tokens + system_tokens}) + buffer ({response_buffer}) exceed limit ({max_limit})."
+                )
+
+            self.logger.warning(
+                f"[{context}] Truncation complete. Removed {removed_count} messages ({removed_tokens_count} tokens). Final history size: {current_history_tokens + system_tokens} tokens."
+            )
+
+            # Construct the final list
+            final_messages = ([system_message] if system_message else []) + history_messages
+            return final_messages
+
+        except Exception as e:
+            self.logger.exception(
+                f"[{context}] Unexpected error during history preparation/token counting: {e}"
+            )
+            # Wrap unexpected errors during token handling
+            raise LLMOrchestrationError(
+                f"Failed to prepare history due to token counting/limit error: {e}"
+            ) from e
+
     def _query_agent_and_update_logs(
         self,
         llm_to_query: LLMInterface,
-        prompt_content: str,  # Keeping for now, but should be empty if prompt added to history first
         role_name: str,
         conversation_history: Conversation,  # Agent's perspective history
         other_conversations_history: Optional[List[Conversation]] = None,
@@ -699,7 +810,6 @@ class SolutionImprovementOrchestrator:
 
         Args:
             llm_to_query: The LLMInterface instance to query.
-            prompt_content: The prompt content (might be empty if using history).
             role_name: The specific role name for logging.
             conversation_history: The Conversation object holding the agent's view.
             other_conversations_history: List of other Conversation objects to update.
@@ -715,19 +825,24 @@ class SolutionImprovementOrchestrator:
         try:
             self.logger.info(f"Querying {role_name}...")
             # Ensure prompt is in history if needed
-            # If prompt_content is not empty, it implies it wasn't added to history yet.
-            # This depends on how the calling functions (_run_xxx_turn) manage history.
-            # Assuming history IS managed correctly by callers and prompt_content is redundant/empty.
-            if prompt_content:
-                self.logger.warning(
-                    "prompt_content provided to _query_agent_and_update_logs, but history is expected to contain the prompt."
-                )
-                # Decide: Add it now? -> conversation_history.add_user_message(prompt_content) Or rely on caller?
+            # The calling function is responsible for adding the prompt/context
+            # as the last user message in conversation_history before calling this.
+            # if prompt_content:
+            #     self.logger.warning(
+            #         "prompt_content provided to _query_agent_and_update_logs, but history is expected to contain the prompt."
+            #     )
+
+            # Prepare history, handling token limits
+            messages_to_send = self._prepare_history_for_llm(
+                llm_service=llm_to_query,
+                messages=conversation_history.get_messages(),
+                context=f"{role_name} Query",
+            )
 
             response_content = llm_to_query.query(
                 prompt="",  # Assuming prompt is last message in history now
                 use_conversation=False,  # Use explicit history provided
-                conversation_history=conversation_history.get_messages(),
+                conversation_history=messages_to_send,  # Use the prepared list
                 **(query_kwargs or {}),
             )
             self.logger.info(f"{role_name} responded successfully.")
@@ -742,17 +857,6 @@ class SolutionImprovementOrchestrator:
                 raise LLMOrchestrationError("Main conversation log not initialized.")
             self.main_conversation_log.add_message(role=role_name, content=response_content)
             self.logger.debug(f"Added {role_name}'s response to the main conversation log.")
-
-            # 4. Update other conversation histories (e.g., add Debater's response to Primary's history)
-            if other_conversations_history:
-                # The original logic added the *other* agent's response as a 'user' message
-                # to the current agent's history. This seems correct for context.
-                message_to_add_for_others = f"[{role_name}]: {response_content}"
-                for other_conv in other_conversations_history:
-                    other_conv.add_user_message(message_to_add_for_others)
-                self.logger.debug(
-                    f"Updated {len(other_conversations_history)} other conversations with {role_name}'s response."
-                )
 
             return response_content
 
@@ -777,7 +881,8 @@ class SolutionImprovementOrchestrator:
         json_result: bool = True,
     ) -> Union[Dict, str]:
         """
-        Generates a result from an LLM, verifies (if JSON), and attempts to fix errors.
+        Generates a result using an LLM, verifies it (parsing, schema validation),
+        and attempts to fix errors iteratively up to a maximum number of attempts.
 
         Args:
             llm_service: LLM interface to use.
@@ -805,97 +910,147 @@ class SolutionImprovementOrchestrator:
                 "Prompt inputs not prepared before generating verified result."
             )
 
-        last_response = None
-        last_error = None
+        response: Optional[str] = None
+        last_error_str: str = (
+            "No error encountered"  # Keep track of the string representation for logging
+        )
+        last_error_obj: Optional[Exception] = None  # Store the last actual exception object
 
-        for attempt in range(max_improvement_iterations):
+        # Initialize conversation history for the generation LLM if needed
+        generation_conversation = Conversation(system_message=llm_service.get_system_message())
+
+        current_prompt = main_prompt_or_template
+
+        for attempt in range(1, max_improvement_iterations + 1):
             self.logger.info(
-                f"Attempt {attempt + 1}/{max_improvement_iterations} for context: {context}"
+                f"Context '{context}': Generating result (Attempt {attempt}/{max_improvement_iterations})"
             )
-
-            if attempt == 0:
-                # Initial attempt with the main prompt
-                prompt = main_prompt_or_template
-            else:
-                # Subsequent attempts: use the fix prompt builder
-                if last_response is None or last_error is None:
-                    # This should not happen if attempt > 0
-                    raise LLMOrchestrationError(
-                        "Cannot build fix prompt: missing last response or error."
-                    )
-
-                # Update prompt_inputs with data needed for the fix prompt
-                self.prompt_inputs.response_to_fix = last_response
-                self.prompt_inputs.errors_to_fix = str(last_error)  # Pass error as string
-
-                try:
-                    prompt = fix_prompt_builder(self.prompt_inputs)
-                    self.logger.debug(f"Fix prompt generated for attempt {attempt + 1}.")
-                except Exception as e:
-                    self.logger.error(f"Failed to build fix prompt: {e}", exc_info=True)
-                    raise LLMOrchestrationError(f"Failed to build fix prompt: {e}") from e
+            response_content = None
+            response_to_fix = None  # Store raw response for potential fix prompt
 
             try:
-                # Query the LLM
-                response = llm_service.query(prompt, use_conversation=use_conversation)
-                last_response = response  # Store for potential next fix prompt
+                # === Check Token Limits Before Query (Stateless Case) ===
+                if not use_conversation:
+                    required_buffer = (
+                        llm_service.max_tokens + 10 if llm_service.max_tokens else 250 + 10
+                    )  # Add buffer
+                    context_limit = llm_service.get_context_limit()
+                    history_token_limit = (
+                        context_limit - required_buffer if context_limit else float("inf")
+                    )
 
-                if not json_result:
-                    self.logger.info(f"Context '{context}': Non-JSON result obtained successfully.")
-                    return response  # Return raw string if no JSON expected
-
-                # Attempt to parse and validate JSON
-                parsed_json = parse_json_response(response, self.logger)  # Using util function
-                if result_schema:
                     try:
-                        jsonschema.validate(instance=parsed_json, schema=result_schema)
-                        self.logger.info(
-                            f"Context '{context}': JSON result parsed and validated successfully."
-                        )
-                        return parsed_json  # Success!
-                    except jsonschema.exceptions.ValidationError as e:
+                        prompt_tokens = llm_service.count_tokens(current_prompt)
+                    except Exception as token_error:
                         self.logger.warning(
-                            f"Context '{context}': JSON validation failed (Attempt {attempt + 1}): {e.message}"
+                            f"Context '{context}': Token counting failed for stateless prompt on attempt {attempt}: {token_error}"
                         )
-                        last_error = f"Schema validation failed: {e.message}"
-                        # Continue to next iteration to try fixing
+                        err_msg = f"Token counting failed for stateless prompt: {token_error}"
+                        last_error_str = err_msg
+                        # Fix syntax error - store the exception directly
+                        last_error_obj = token_error
+                        if attempt == max_improvement_iterations:
+                            break  # Break to raise MaxIterationsExceededError outside the loop
+                        continue  # Try again if iterations remain
+
+                    if prompt_tokens > history_token_limit:
+                        error_msg = (
+                            f"Context '{context}': Single prompt exceeded token limit "
+                            f"(Prompt: {prompt_tokens}, Limit: {history_token_limit}) "
+                            f"on attempt {attempt}. Skipping generation."
+                        )
+                        self.logger.warning(error_msg)
+                        last_error_str = error_msg
+                        last_error_obj = LLMOrchestrationError(error_msg)
+                        if attempt == max_improvement_iterations:
+                            break  # Break to raise MaxIterationsExceededError outside the loop
+                        continue  # Try again if iterations remain
+
+                # === Perform LLM Query ===
+                if use_conversation:
+                    generation_conversation.add_user_message(current_prompt)
+                    prepared_history = self._prepare_history_for_llm(
+                        llm_service,
+                        generation_conversation.get_messages(),
+                        context=f"{context} - Gen Prep",
+                    )
+                    response_content = llm_service.query(
+                        prompt="", use_conversation=False, conversation_history=prepared_history
+                    )
+                    generation_conversation.add_assistant_message(response_content)
+                else:
+                    response_content = llm_service.query(current_prompt, use_conversation=False)
+
+                response_to_fix = response_content
+
+                # === Verification ===
+                if json_result:
+                    result: Union[Dict, str] = parse_json_response(
+                        self.logger, response_content, context, schema=result_schema
+                    )
+                    self.logger.info(
+                        f"Context '{context}': Generation and validation successful (Attempt {attempt})."
+                    )
+                    return result
                 else:
                     self.logger.info(
-                        f"Context '{context}': JSON result parsed successfully (no schema validation)."
+                        f"Context '{context}': Generation successful (non-JSON) (Attempt {attempt})."
                     )
-                    return parsed_json  # Success (parsed, no schema)
+                    return response_content
 
-            except json.JSONDecodeError as e:
+            except (LLMResponseError, SchemaValidationError) as e:
                 self.logger.warning(
-                    f"Context '{context}': JSON parsing failed (Attempt {attempt + 1}): {e}"
+                    f"Context '{context}': Generation/Verification failed (Attempt {attempt}/{max_improvement_iterations}): {type(e).__name__}: {e}"
                 )
-                last_error = f"JSON parsing failed: {e}"
-                # Continue to next iteration
-            except LLMResponseError as e:
+                last_error_str = f"{type(e).__name__}: {e}"  # Keep string for logging
+                last_error_obj = e  # Store the actual exception object
+
+                if attempt < max_improvement_iterations:
+                    try:
+                        if not self.prompt_inputs:
+                            self._prepare_prompt_inputs()
+                        self.prompt_inputs.response_to_fix = (
+                            response_to_fix if response_to_fix else "No response received."
+                        )
+                        self.prompt_inputs.errors_to_fix = str(e)
+                        fix_prompt = fix_prompt_builder(self.prompt_inputs)
+                        current_prompt = fix_prompt
+                        self.logger.info(
+                            f"Context '{context}': Generated fix prompt for next attempt."
+                        )
+                    except Exception as builder_error:
+                        raise LLMOrchestrationError(
+                            f"Context '{context}': Failed to build fix prompt: {builder_error}"
+                        ) from builder_error
+                # If last attempt, loop exits and raises MaxIterationsExceededError below
+
+            except LLMClientError as e:
                 self.logger.error(
-                    f"Context '{context}': LLM query failed (Attempt {attempt + 1}): {e}",
+                    f"Context '{context}': Non-recoverable LLM client error during generation: {e}",
                     exc_info=True,
                 )
-                raise  # Propagate LLM errors immediately
+                raise  # Propagate immediately
+
             except Exception as e:
                 self.logger.error(
-                    f"Context '{context}': Unexpected error during generation/verification (Attempt {attempt+1}): {e}",
+                    f"Context '{context}': Unexpected error during generation/verification attempt {attempt}: {e}",
                     exc_info=True,
                 )
-                last_error = f"Unexpected error: {e}"  # Treat as a fixable error for next attempt
+                last_error_str = f"Unexpected error: {e}"  # Keep string for logging
+                last_error_obj = e  # Store the actual exception object
+                break  # Exit loop immediately on unexpected errors to raise MaxIterationsExceededError below
 
-        # If loop finishes without returning, max iterations were exceeded
-        self.logger.error(
-            f"Context '{context}': Failed to generate valid result after {max_improvement_iterations} attempts."
+        # === Loop finished without success ===
+        final_error_message = (
+            f"Context '{context}': Failed to produce a valid result after {max_improvement_iterations} attempts. "
+            f"Last error: {last_error_str}"  # Log the string representation
         )
-        if isinstance(last_error, str) and "Schema validation failed" in last_error:
-            # If the last error was validation, raise specific exception
-            raise SchemaValidationError(
-                f"Failed to validate result for '{context}' against schema after {max_improvement_iterations} attempts. Last error: {last_error}. Last response: {last_response}",
-                schema=result_schema,
-                instance=last_response,  # Pass the raw response that failed
-            )
+        self.logger.error(final_error_message)
+
+        # Raise MaxIterationsExceededError, chaining the *actual* last specific error encountered
+        if last_error_obj:
+            raise MaxIterationsExceededError(final_error_message) from last_error_obj
         else:
-            raise MaxIterationsExceededError(
-                f"Failed to generate valid result for '{context}' after {max_improvement_iterations} attempts. Last error: {last_error}. Last response: {last_response}"
-            )
+            # This case should be rare (e.g., max_improvement_iterations <= 0)
+            # but raise the generic error if no specific exception was captured.
+            raise MaxIterationsExceededError(final_error_message)

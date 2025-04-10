@@ -2,6 +2,7 @@
 
 """Manages conversation state for multi-agent interactions."""
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 # Assuming standard project structure
@@ -11,6 +12,7 @@ try:
 except ImportError:
     # Basic fallbacks if running standalone or structure differs
     import logging
+    from dataclasses import dataclass
 
     setup_logger = lambda name: logging.getLogger(name)
 

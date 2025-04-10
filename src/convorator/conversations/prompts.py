@@ -1,57 +1,32 @@
 # prompts.py
+from __future__ import annotations
+import json
 from dataclasses import dataclass, field
 import logging
 from typing import Callable, Dict, Optional
 
 from convorator.conversations.state import MultiAgentConversation
-from convorator.conversations.configurations import SolutionLLMGroup
 
-
-@dataclass
-class PromptBuilderInputs:
-    """Holds static configuration and the conversation history."""
-
-    # Static Configuration & Context (Set once by orchestrator)
-    topic: Optional[str] = None
-    logger: logging.Logger
-    llm_group: Optional[SolutionLLMGroup] = None  # Provides access to LLMs if needed
-    solution_schema: Optional[Dict] = None  # e.g., for format instructions
-    initial_solution: Optional[str] = None
-    requirements: Optional[str] = None
-    assessment_criteria: Optional[str] = None
-    moderator_instructions: Optional[str] = None  # Core instructions for moderator role
-    debate_context: Optional[str] = None  # Overall context description for the debate
-    primary_role_name: Optional[str] = "Primary"  # Role names are likely static
-    debater_role_name: Optional[str] = "Debater"
-    moderator_role_name: Optional[str] = "Moderator"
-    expect_json_output: bool = False  # Hint for formatting instructions
-
-    # Conversation History (Updated by orchestrator, passed to builders)
-    conversation_history: Optional[MultiAgentConversation] = None
-
-    # --- Dynamic State (Set by orchestrator before specific calls if needed) ---
-    initial_prompt_content: Optional[str] = None  # Result of build_initial_prompt
-    moderator_summary: Optional[str] = None  # Result of summary generation
-    response_to_fix: Optional[str] = None  # Response that needs fixing
-    errors_to_fix: Optional[str] = None  # Errors identified in the response
+# Import shared types
+from convorator.conversations.types import PromptBuilderInputs, LoggerProtocol
 
 
 def _get_last_message_content_by_role(
-    history: Optional[MultiAgentConversation], role_name: str, logger: logging.Logger
+    history: Optional[MultiAgentConversation], role_name: str, logger: LoggerProtocol
 ) -> Optional[str]:
     """Helper to safely get the content of the last message by a specific role."""
     if not history:
         logger.warning(f"Cannot get message for role '{role_name}': Conversation history is None.")
         return None
-    message = history.get_last_message_by_role(role_name)
-    if message:
-        return message.get("content")
+    messages = history.get_messages_by_role(role_name)
+    if messages:
+        return messages[-1].get("content")
     logger.debug(f"No message found for role '{role_name}' in history.")
     return None
 
 
 def _get_nth_last_message_content_by_role(
-    history: Optional[MultiAgentConversation], role_name: str, n: int, logger: logging.Logger
+    history: Optional[MultiAgentConversation], role_name: str, n: int, logger: LoggerProtocol
 ) -> Optional[str]:
     """Helper to safely get the content of the nth last message by a specific role."""
     if not history:
@@ -59,8 +34,7 @@ def _get_nth_last_message_content_by_role(
         return None
     messages = history.get_messages_by_role(role_name)
     if messages and len(messages) >= n:
-        # Messages are typically appended, so the nth last is len - n
-        return messages[len(messages) - n].get("content")
+        return messages[-n].get("content")
     logger.debug(f"Could not find the {n}th last message for role '{role_name}'.")
     return None
 
@@ -100,15 +74,15 @@ def default_build_moderator_context(inputs: PromptBuilderInputs) -> str:
             )
 
     # Start with background info
-    moderator_full_context = f"BACKGROUND CONTEXT:\n{inputs.debate_context}\n\n"
-    moderator_full_context += (
-        f"INITIAL TASK:\n{inputs.initial_prompt_content}\n\n"  # Use initial_prompt_content
-    )
+    moderator_full_context = f"BACKGROUND CONTEXT:\n{inputs.debate_context or '[Not Provided]'}\n\n"
+    moderator_full_context += f"INITIAL TASK:\n{inputs.initial_prompt_content or '[Not Provided]'}\n\n"  # Use initial_prompt_content
 
     moderator_full_context += f"RECENT EXCHANGE TO MODERATE:\n{recent_exchange_str}\n\n"
 
     # Add the specific instructions
-    moderator_full_context += f"YOUR INSTRUCTIONS AS MODERATOR:\n{inputs.moderator_instructions}"
+    moderator_full_context += (
+        f"YOUR INSTRUCTIONS AS MODERATOR:\n{inputs.moderator_instructions or '[Not Provided]'}"
+    )
 
     return moderator_full_context
 
@@ -206,18 +180,39 @@ def default_build_primary_prompt(inputs: PromptBuilderInputs) -> str:
 
 def default_build_initial_prompt(inputs: PromptBuilderInputs) -> str:
     """Builds the initial prompt string from inputs."""
-    if not all([inputs.initial_solution, inputs.requirements, inputs.assessment_criteria]):
+    if not all(
+        [inputs.topic, inputs.initial_solution, inputs.requirements, inputs.assessment_criteria]
+    ):
         # Log a warning or error if essential parts are missing
         inputs.logger.warning(
-            "Building initial prompt with missing solution, requirements, or criteria."
+            "Building initial prompt with missing topic, solution, requirements, or criteria."
         )
 
-    return (
-        f"Initial solution:\n{inputs.initial_solution or '[Not provided]'}\n\n"
-        f"Requirements:\n{inputs.requirements or '[Not provided]'}\n\n"
-        f"Assessment criteria:\n{inputs.assessment_criteria or '[Not provided]'}\n\n"
-        "Discuss and critically analyze this solution. Identify strengths, weaknesses, and suggest improvements."
-    )
+    topic = inputs.topic or "[Not Provided]"
+    initial_solution = inputs.initial_solution or "[Not Provided]"
+    requirements = inputs.requirements or "[Not Provided]"
+    assessment_criteria = inputs.assessment_criteria or "[Not Provided]"
+
+    # Explicitly join parts to avoid f-string parsing issues
+    parts = [
+        f"Critically analyze the proposed initial solution for the topic '{topic}' provided below.",
+        f"Evaluate it against the requirements and assessment criteria.",
+        f"Identify strengths, weaknesses, potential issues, and areas for improvement.",
+        "\n",
+        "INITIAL SOLUTION:",
+        "```",
+        initial_solution,
+        "```",
+        "\n",
+        "REQUIREMENTS:",
+        requirements,
+        "\n",
+        "ASSESSMENT CRITERIA:",
+        assessment_criteria,
+    ]
+    full_prompt = "\n".join(parts)
+
+    return full_prompt
 
 
 # Renamed from default_synthesize_moderation_summary
@@ -226,17 +221,16 @@ def default_build_summary_prompt(inputs: PromptBuilderInputs) -> str:
     Builds the prompt FOR the moderator LLM to synthesize a summary, using PromptBuilderInputs.
     Does NOT call the LLM itself. Requires the conversation history to be passed within inputs.
     """
-    if inputs.logger:
-        inputs.logger.info("Building moderation summary prompt.")
+    inputs.logger.info("Building moderation summary prompt.")
 
     # The prompt itself doesn't need the history *content* directly,
     # but the calling code will pass history + this prompt to the LLM.
-    prompt = (
-        "Given the preceding debate history, provide:\n"
-        "1. A concise summary of strengths and weaknesses discussed.\n"
-        "2. Specific actionable improvements suggested or confirm no improvements required.\n"
-        "3. Clear instructions for generating an improved final solution, ensuring alignment with the original requirements and assessment criteria."
-    )
+    # Using a triple-quoted string for clarity
+    prompt = f"""Given the preceding debate history, provide:
+
+1. A concise summary of strengths and weaknesses discussed.
+2. Specific actionable improvements suggested or confirm no improvements required.
+3. Clear instructions for generating an improved final solution, ensuring alignment with the original requirements and assessment criteria."""
     return prompt
 
 
@@ -245,22 +239,26 @@ def default_build_improvement_prompt(inputs: PromptBuilderInputs) -> str:
     if not inputs.moderator_summary:
         inputs.logger.warning("Building solution improvement prompt without moderator summary.")
 
-    prompt = (
-        f"Original solution:\n{inputs.initial_solution or '[Not Provided]'}\n\n"
-        f"Moderator's summary and instructions:\n{inputs.moderator_summary or '[Not Provided]'}\n\n"
-        "Please generate an improved solution based *only* on the moderator's summary and instructions. "
-        f"Adhere strictly to the requirements and assessment criteria mentioned earlier. "
-    )
-    if inputs.expect_json_output:
-        prompt += "Format your response as a valid JSON object."
-        if inputs.solution_schema:
-            prompt += f" matching this schema:\n```json\n{json.dumps(inputs.solution_schema, indent=2)}\n```"
-        else:
-            prompt += " Use appropriate keys and values based on the context."
-    else:
-        prompt += "Format your response as a plain text string."
+    # Start with core instructions
+    prompt_parts = [
+        f"Original solution:\n{inputs.initial_solution or '[Not Provided]'}",
+        f"Moderator's summary and instructions:\n{inputs.moderator_summary or '[Not Provided]'}",
+        "Please generate an improved solution based *only* on the moderator's summary and instructions.",
+        f"Adhere strictly to the requirements and assessment criteria mentioned earlier.",
+    ]
 
-    return prompt
+    # Add format instructions based on expect_json_output
+    if inputs.expect_json_output:
+        prompt_parts.append("Format your response as a valid JSON object.")
+        if inputs.solution_schema:
+            schema_str = json.dumps(inputs.solution_schema, indent=2)
+            prompt_parts.append(f" matching this schema:\n```json\n{schema_str}\n```")
+        else:
+            prompt_parts.append(" Use appropriate keys and values based on the context.")
+    else:
+        prompt_parts.append("Format your response as a plain text string.")
+
+    return "\n\n".join(prompt_parts)  # Join with double newline for clarity
 
 
 def default_build_fix_prompt(inputs: PromptBuilderInputs) -> str:
@@ -269,21 +267,25 @@ def default_build_fix_prompt(inputs: PromptBuilderInputs) -> str:
         inputs.logger.error("Fix prompt builder called without response or errors to fix.")
         return "[Error: Missing input for fix prompt]"
 
-    fix_request = (
-        f"The following response you provided resulted in errors:\n---\n{inputs.response_to_fix}\n---\n"
-        f"The errors encountered were:\n{inputs.errors_to_fix}\n\n"
-        f"Please regenerate the response, correcting these errors. "
-        f"Ensure the corrected response still meets the original requirements."
-    )
+    # Start with core instructions
+    prompt_parts = [
+        f"The following response you provided resulted in errors:\n---\n{inputs.response_to_fix}\n---",
+        f"The errors encountered were:\n{inputs.errors_to_fix}",
+        f"Please regenerate the response, correcting these errors.",
+        f"Ensure the corrected response still meets the original requirements.",
+    ]
+
     # Add format instructions again for clarity
     if inputs.expect_json_output:
-        fix_request += " Format your corrected response as a valid JSON object."
+        prompt_parts.append("Format your corrected response as a valid JSON object.")
         if inputs.solution_schema:
-            fix_request += f" matching the schema provided previously."
+            # Schema assumed to be available from previous context
+            prompt_parts.append(" matching the schema provided previously.")
+        # No else needed here? If no schema, just ask for JSON.
     else:
-        fix_request += " Format your corrected response as a plain text string."
+        prompt_parts.append("Format your corrected response as a plain text string.")
 
-    return fix_request
+    return "\n\n".join(prompt_parts)  # Join with double newline for clarity
 
 
 def default_build_debate_user_prompt(inputs: PromptBuilderInputs) -> str:
@@ -313,35 +315,12 @@ def default_build_debate_user_prompt(inputs: PromptBuilderInputs) -> str:
 
 
 def default_build_moderator_instructions(inputs: PromptBuilderInputs) -> str:
-    """Builds the default instructions for the Moderator role."""
-    # Note: inputs.moderator_instructions would contain user-provided instructions.
-    # This function generates the *default* if none were provided.
+    """Builds the default instructions FOR the Moderator role (system message)."""
+    # User-provided instructions are in inputs.moderator_instructions and used in the context prompt builder.
+    # This function defines the *role* of the moderator.
     return (
-        f"Moderator, analyze the last exchange ({inputs.debater_role_name} -> {inputs.primary_role_name}). Provide:\n"
-        f"1. Assessment of reasoning, clarity, and adherence to instructions/requirements.\n"
-        f"2. Specific suggestions or questions for the next {inputs.debater_role_name}'s response.\n"
-        f"3. Corrections for any factual errors or logical fallacies observed."
+        f"You are the Moderator. Your role is to objectively analyze the exchange between {inputs.primary_role_name} and {inputs.debater_role_name}. "
+        f"Focus on the quality of arguments based on the initial requirements and assessment criteria. "
+        f"Provide clear, actionable feedback to guide the {inputs.debater_role_name} for their next response. "
+        f"Do not introduce new opinions or solutions yourself. Focus on facilitating improvement."
     )
-
-
-@dataclass
-class PromptBuilderFunctions:
-    """Holds references to the functions used for building prompts."""
-
-    build_initial_prompt: Callable[[PromptBuilderInputs], str] = default_build_initial_prompt
-    # Added builder for the initial user message in the debate
-    build_debate_user_prompt: Callable[[PromptBuilderInputs], str] = (
-        default_build_debate_user_prompt
-    )
-    build_moderator_context: Callable[[PromptBuilderInputs], str] = default_build_moderator_context
-    # Added builder for the default moderator instructions
-    build_moderator_instructions: Callable[[PromptBuilderInputs], str] = (
-        default_build_moderator_instructions
-    )
-    build_primary_prompt: Callable[[PromptBuilderInputs], str] = default_build_primary_prompt
-    build_debater_prompt: Callable[[PromptBuilderInputs], str] = default_build_debater_prompt
-    build_summary_prompt: Callable[[PromptBuilderInputs], str] = default_build_summary_prompt
-    build_improvement_prompt: Callable[[PromptBuilderInputs], str] = (
-        default_build_improvement_prompt
-    )
-    build_fix_prompt: Callable[[PromptBuilderInputs], str] = default_build_fix_prompt

@@ -1,3 +1,4 @@
+# convorator.exceptions.py
 """Custom exception classes for the Convorator package."""
 
 from typing import Any, Dict, Optional
@@ -32,7 +33,11 @@ class MaxIterationsExceededError(LLMOrchestrationError):
 class LLMResponseError(ConvoratorError):
     """Indicates an error related to the LLM's response (e.g., API error, empty response)."""
 
-    pass
+    def __init__(
+        self, message: str, original_exception: Optional[Exception] = None, *args: Any
+    ) -> None:
+        super().__init__(message, *args)
+        self.original_exception = original_exception
 
 
 # Added from llm_client.py

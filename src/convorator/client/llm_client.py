@@ -64,6 +64,7 @@ try:
         LLMConfigurationError,
         LLMResponseError,
     )
+    import tiktoken  # Add tiktoken import
 except ImportError:
     # Fallback for running the script directly or if structure differs
     import logging
@@ -72,16 +73,20 @@ except ImportError:
 
     # Define basic exceptions if import fails (not ideal for production)
     class LLMClientError(Exception):
+        """Base class for LLM client errors."""
+
         pass
 
     class LLMConfigurationError(LLMClientError):
+        """Raised when there are configuration issues (API keys, model names, etc.)."""
+
         pass
 
-    class LLMResponseError(Exception):
-        pass
+    # Define tiktoken as None if it couldn't be imported
+    tiktoken = None
 
     logging.warning(
-        "Could not import from convorator package. Using basic logging and exception definitions."
+        "Could not import from convorator package or tiktoken. Using basic logging and exception definitions. Token counting may be approximate."
     )
 
 
@@ -208,6 +213,16 @@ class LLMInterface(ABC):
         """
         pass
 
+    @abstractmethod
+    def count_tokens(self, text: str) -> int:
+        """Estimates the number of tokens for the given text for this specific LLM."""
+        pass
+
+    @abstractmethod
+    def get_context_limit(self) -> int:
+        """Returns the maximum context token limit for the configured model."""
+        pass
+
     def query(
         self,
         prompt: str,
@@ -257,13 +272,17 @@ class LLMInterface(ABC):
                 if conversation_history is not None:
                     # Use provided history
                     messages_to_send = list(conversation_history)  # Create a copy
-                    # Ensure system message is prepended if defined and not already present
-                    if self._system_message and not any(
-                        m.get("role") == "system" for m in messages_to_send
-                    ):
+
+                    # Remove any existing system message from the provided history
+                    if self._system_message is not None:
+                        messages_to_send = [
+                            msg for msg in messages_to_send if msg.get("role") != "system"
+                        ]
+                        # Insert the interface's system message at the beginning
                         messages_to_send.insert(
                             0, {"role": "system", "content": self._system_message}
                         )
+                    # If no system message is set on interface but there's one in history, keep it (handled by default)
                 else:
                     # Start fresh, only system message (if any) and prompt
                     messages_to_send = []
@@ -363,11 +382,15 @@ class LLMInterface(ABC):
 # --- Concrete LLM Client Implementations ---
 
 
+# Default context limit fallback if API fetch fails
+DEFAULT_CONTEXT_LIMIT_FALLBACK = 8192
+
+
 class OpenAILLM(LLMInterface):
     """Concrete implementation for OpenAI's API (GPT models)."""
 
-    # List common/recent models. The API might support others.
     SUPPORTED_MODELS = [
+        # GPT-4 / 4o / Turbo
         "gpt-4o",
         "gpt-4-turbo",
         "gpt-4-turbo-preview",
@@ -378,14 +401,43 @@ class OpenAILLM(LLMInterface):
         "gpt-4-0613",
         "gpt-4-32k",
         "gpt-4-32k-0613",
+        # GPT-3.5
         "gpt-3.5-turbo-0125",
         "gpt-3.5-turbo",
         "gpt-3.5-turbo-1106",
-        "gpt-3.5-turbo-instruct",
         "gpt-3.5-turbo-16k",
         "gpt-3.5-turbo-0613",
         "gpt-3.5-turbo-16k-0613",
+        # GPT-3.5 Instruct
+        "gpt-3.5-turbo-instruct",
     ]
+
+    # Tiktoken encoding mapping (add more as needed)
+    # See: https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
+    MODEL_TO_ENCODING = {
+        # --- GPT-4 / 4o / Turbo --- uses o200k_base for -o models, cl100k_base otherwise
+        "gpt-4o": "o200k_base",
+        "gpt-4-turbo": "cl100k_base",
+        "gpt-4-turbo-preview": "cl100k_base",
+        "gpt-4-0125-preview": "cl100k_base",
+        "gpt-4-1106-preview": "cl100k_base",
+        "gpt-4-vision-preview": "cl100k_base",
+        "gpt-4": "cl100k_base",
+        "gpt-4-0613": "cl100k_base",
+        "gpt-4-32k": "cl100k_base",
+        "gpt-4-32k-0613": "cl100k_base",
+        # --- GPT-3.5 --- uses cl100k_base
+        "gpt-3.5-turbo-0125": "cl100k_base",
+        "gpt-3.5-turbo": "cl100k_base",
+        "gpt-3.5-turbo-1106": "cl100k_base",
+        "gpt-3.5-turbo-16k": "cl100k_base",
+        "gpt-3.5-turbo-0613": "cl100k_base",
+        "gpt-3.5-turbo-16k-0613": "cl100k_base",
+        # --- GPT-3.5 Instruct --- uses p50k_base
+        "gpt-3.5-turbo-instruct": "p50k_base",
+        # Add other models (like text-embedding-ada-002, older models) if needed
+    }
+    DEFAULT_ENCODING = "cl100k_base"  # Fallback encoding
 
     def __init__(
         self,
@@ -399,6 +451,7 @@ class OpenAILLM(LLMInterface):
         """Initializes the OpenAI client.
 
         Requires the 'openai' package to be installed (`pip install openai`).
+        Requires the 'tiktoken' package for accurate token counting (`pip install tiktoken`).
 
         Raises:
             LLMConfigurationError: If API key is missing or client initialization fails.
@@ -418,13 +471,15 @@ class OpenAILLM(LLMInterface):
                 "OpenAI API key not provided. Set the OPENAI_API_KEY environment variable or pass it during initialization."
             )
 
+        # Use the class attribute list for checking
         if model not in self.SUPPORTED_MODELS:
             logger.warning(
-                f"Model '{model}' is not in the explicitly supported list for OpenAILLM ({self.SUPPORTED_MODELS}). Proceeding, but compatibility is not guaranteed."
+                f"Model '{model}' is not in the explicitly supported list for OpenAILLM context/token estimation. Proceeding, but compatibility is not guaranteed."
             )
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self._encoding: Optional[Any] = None  # Store tiktoken encoding object lazily
 
         try:
             # Initialize the OpenAI client instance
@@ -435,11 +490,80 @@ class OpenAILLM(LLMInterface):
 
         self._system_message = system_message
         self._role_name = role_name or "Assistant"
-        # Initialize conversation with the system message
         self.conversation = Conversation(system_message=self._system_message)
         logger.info(
             f"OpenAILLM initialized. Model: {self.model}, Temperature: {self.temperature}, Max Tokens: {self.max_tokens}"
         )
+
+        # Fetch context limit during initialization
+        self._context_limit = self._fetch_context_limit()
+
+    def _fetch_context_limit(self) -> int:
+        """Fetches the context window size (in tokens) for the current model from the OpenAI API.
+
+        Returns:
+            int: The context window size in tokens, or a fallback value if the fetch fails.
+        """
+        try:
+            model_info = self.client.models.retrieve(self.model)
+            context_window = getattr(model_info, "context_window", None)
+            if context_window:
+                logger.debug(
+                    f"Successfully fetched context limit for {self.model}: {context_window}"
+                )
+                return context_window
+            else:
+                logger.warning(
+                    f"Could not find context_window attribute for {self.model}. Using fallback."
+                )
+                return DEFAULT_CONTEXT_LIMIT_FALLBACK
+        except self.openai.NotFoundError as e:
+            logger.warning(
+                f"Model {self.model} not found during context limit fetch: {e}. Using fallback."
+            )
+            return DEFAULT_CONTEXT_LIMIT_FALLBACK
+        except (
+            self.openai.APIConnectionError,
+            self.openai.RateLimitError,
+            self.openai.APIStatusError,
+        ) as e:
+            logger.warning(f"Error fetching context limit for {self.model}: {e}. Using fallback.")
+            return DEFAULT_CONTEXT_LIMIT_FALLBACK
+
+    def _get_tiktoken_encoding(self):
+        """Lazily loads and returns the tiktoken encoding for the current model."""
+        if self._encoding is None:
+            if tiktoken is None:
+                logger.warning(
+                    "'tiktoken' library not found. Cannot accurately count tokens for OpenAI. Install using 'pip install tiktoken'"
+                )
+                return None  # Indicate failure to load
+
+            encoding_name = self.MODEL_TO_ENCODING.get(self.model, self.DEFAULT_ENCODING)
+            if encoding_name != self.DEFAULT_ENCODING and self.model not in self.MODEL_TO_ENCODING:
+                logger.warning(
+                    f"Using default encoding '{self.DEFAULT_ENCODING}' for unknown OpenAI model '{self.model}'. Token count may be inaccurate."
+                )
+
+            try:
+                self._encoding = tiktoken.get_encoding(encoding_name)
+                logger.debug(f"Loaded tiktoken encoding: {encoding_name} for model {self.model}")
+            except ValueError as e:
+                logger.error(
+                    f"Failed to get tiktoken encoding '{encoding_name}': {e}. Falling back to default."
+                )
+                try:
+                    self._encoding = tiktoken.get_encoding(self.DEFAULT_ENCODING)
+                    logger.debug(f"Using fallback tiktoken encoding: {self.DEFAULT_ENCODING}")
+                except ValueError as e_fallback:
+                    logger.error(
+                        f"Failed to get fallback tiktoken encoding '{self.DEFAULT_ENCODING}': {e_fallback}. Token counting disabled."
+                    )
+                    # Set encoding to a value indicating failure, but not None to avoid retrying
+                    self._encoding = "FAILED_TO_LOAD"
+
+        # Return None if loading failed
+        return None if self._encoding == "FAILED_TO_LOAD" else self._encoding
 
     def _call_api(self, messages: List[Dict[str, str]]) -> str:
         """Calls the OpenAI Chat Completions API."""
@@ -538,7 +662,7 @@ class OpenAILLM(LLMInterface):
             try:
                 error_json = e.response.json()
                 error_detail = error_json.get("error", {}).get("message", str(e))
-            except:  # Handle cases where response is not JSON or parsing fails
+            except:
                 pass
             raise LLMResponseError(
                 f"OpenAI API returned an error (Status {e.status_code}): {error_detail}"
@@ -547,10 +671,58 @@ class OpenAILLM(LLMInterface):
         except self.openai.OpenAIError as e:
             logger.error(f"An unexpected OpenAI client error occurred: {e}")
             raise LLMClientError(f"An unexpected OpenAI client error occurred: {e}") from e
+        # --- Allow specific LLMResponseErrors from validation to pass through ---
+        except LLMResponseError as e:
+            # This catches errors raised explicitly in the validation logic above
+            # (e.g., missing choices, null content)
+            logger.error(f"LLM Response Error: {e}")  # Log it, but let it propagate
+            raise
         # General exception catcher (less likely with specific catches above)
         except Exception as e:
             logger.exception(f"An unexpected error occurred during OpenAI API call: {e}")
             raise LLMClientError(f"Unexpected error during OpenAI API call: {e}") from e
+
+    def count_tokens(self, text: str) -> int:
+        """Counts the number of tokens using tiktoken for the configured model."""
+        encoding = self._get_tiktoken_encoding()
+        if encoding:
+            try:
+                num_tokens = len(encoding.encode(text))
+                logger.debug(
+                    f"Counted {num_tokens} tokens for text (length {len(text)}) using {encoding.name}."
+                )
+                return num_tokens
+            except Exception as e:
+                logger.error(
+                    f"Error using tiktoken encoding '{encoding.name}' to count tokens: {e}"
+                )
+                # Fall through to approximation
+        else:
+            logger.warning("Tiktoken encoding not available.")
+            # Fall through to approximation
+
+        # Fallback approximation (e.g., 4 chars per token)
+        estimated_tokens = len(text) // 4
+        logger.warning(
+            f"Using approximate token count: {estimated_tokens} (based on character count). Install 'tiktoken' for accuracy."
+        )
+        return estimated_tokens
+
+    def get_context_limit(self) -> int:
+        """Returns the context window size (in tokens) fetched during initialization."""
+        logger.debug(f"Returning context limit for {self.model}: {self._context_limit}")
+        return self._context_limit
+
+
+ANTHROPIC_CONTEXT_LIMITS = {
+    "claude-3-opus-20240229": 200000,
+    "claude-3-sonnet-20240229": 200000,
+    "claude-3-haiku-20240307": 200000,
+    "claude-2.1": 200000,
+    "claude-2.0": 100000,
+    "claude-instant-1.2": 100000,
+}
+DEFAULT_ANTHROPIC_CONTEXT_LIMIT = 100000  # Fallback
 
 
 class AnthropicLLM(LLMInterface):
@@ -578,6 +750,9 @@ class AnthropicLLM(LLMInterface):
 
         Requires the 'anthropic' package to be installed (`pip install anthropic`).
 
+        Note: Anthropic context limits are currently hardcoded as the API/SDK
+        does not provide a standard way to fetch them dynamically.
+
         Raises:
             LLMConfigurationError: If API key is missing or client initialization fails.
         """
@@ -596,25 +771,39 @@ class AnthropicLLM(LLMInterface):
                 "Anthropic API key not provided. Set the ANTHROPIC_API_KEY environment variable or pass it during initialization."
             )
 
-        if model not in self.SUPPORTED_MODELS:
-            logger.warning(
-                f"Model '{model}' is not in the explicitly supported list for AnthropicLLM ({self.SUPPORTED_MODELS}). Proceeding, but compatibility is not guaranteed."
-            )
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # Get context limit from hardcoded dict
+        self._context_limit = ANTHROPIC_CONTEXT_LIMITS.get(
+            self.model, DEFAULT_ANTHROPIC_CONTEXT_LIMIT
+        )
+        if self.model not in ANTHROPIC_CONTEXT_LIMITS:
+            logger.warning(
+                f"Context limit not defined for Anthropic model '{self.model}'. Using default: {self._context_limit}"
+            )
 
         try:
             self.client = self.anthropic.Anthropic(api_key=self.api_key)
         except Exception as e:
             raise LLMConfigurationError(f"Failed to initialize Anthropic client: {e}") from e
 
-        self._system_message = system_message  # Stored separately, passed in API call
+        # Check max_tokens against the known limit
+        if self.max_tokens > self._context_limit:
+            logger.warning(
+                f"Requested max_tokens ({self.max_tokens}) exceeds the known context limit ({self._context_limit}) for model '{self.model}'. API calls might fail."
+            )
+        elif self.max_tokens > self._context_limit * 0.8:
+            logger.info(
+                f"Requested max_tokens ({self.max_tokens}) is close to the context limit ({self._context_limit}). Ensure input + output fits."
+            )
+
+        self._system_message = system_message
         self._role_name = role_name or "Assistant"
         # Conversation object doesn't need the system message initially for Anthropic
         self.conversation = Conversation()
         logger.info(
-            f"AnthropicLLM initialized. Model: {self.model}, Temperature: {self.temperature}, Max Tokens: {self.max_tokens}"
+            f"AnthropicLLM initialized. Model: {self.model}, Temperature: {self.temperature}, Max Tokens: {self.max_tokens}, Context Limit: {self._context_limit} (Hardcoded)"
         )
 
     def _call_api(self, messages: List[Dict[str, str]]) -> str:
@@ -622,6 +811,7 @@ class AnthropicLLM(LLMInterface):
         system_prompt = self._system_message  # System prompt is passed separately
         # Filter out system message from history, ensure roles are 'user'/'assistant'
         filtered_messages = []
+        approx_input_tokens = 0  # Estimate input tokens
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
@@ -633,6 +823,7 @@ class AnthropicLLM(LLMInterface):
                     logger.warning(f"Skipping message with role '{role}' because content is None.")
                     continue
                 filtered_messages.append({"role": role, "content": content})
+                approx_input_tokens += self.count_tokens(content)  # Add to token estimate
             else:
                 logger.warning(
                     f"Skipping message with unsupported role '{role}' for Anthropic API."
@@ -641,6 +832,16 @@ class AnthropicLLM(LLMInterface):
         if not filtered_messages:
             raise LLMClientError(
                 "Cannot call Anthropic API with an empty message list (after filtering)."
+            )
+
+        # Check estimated tokens against limit
+        if approx_input_tokens + self.max_tokens > self._context_limit:
+            logger.warning(
+                f"Estimated input tokens (~{approx_input_tokens}) + max_tokens ({self.max_tokens}) exceeds context limit ({self._context_limit}). API call might fail."
+            )
+        elif approx_input_tokens > self._context_limit * 0.95:
+            logger.info(
+                f"Estimated input tokens (~{approx_input_tokens}) is very close to context limit ({self._context_limit})."
             )
 
         # --- Anthropic API Constraints Validation ---
@@ -679,9 +880,15 @@ class AnthropicLLM(LLMInterface):
                 logger.error(
                     f"Anthropic response missing 'content'. Stop Reason: {stop_reason}. Response: {response}"
                 )
-                raise LLMResponseError(
-                    f"Invalid response structure from Anthropic: No 'content'. Stop Reason: {stop_reason}."
-                )
+                # Check if stop reason indicates max tokens
+                if stop_reason == "max_tokens":
+                    raise LLMResponseError(
+                        f"Anthropic response likely stopped due to reaching max_tokens ({self.max_tokens}) or context limit ({self._context_limit})."
+                    )
+                else:
+                    raise LLMResponseError(
+                        f"Invalid response structure from Anthropic: No 'content'. Stop Reason: {stop_reason}."
+                    )
 
             # Content is a list of blocks, usually one text block for simple chat
             if not isinstance(response.content, list) or len(response.content) == 0:
@@ -705,7 +912,7 @@ class AnthropicLLM(LLMInterface):
                 # Check stop reason for clues
                 if stop_reason == "max_tokens":
                     raise LLMResponseError(
-                        f"Anthropic response truncated due to max_tokens ({self.max_tokens})."
+                        f"Anthropic response truncated due to max_tokens ({self.max_tokens}) or context limit ({self._context_limit})."
                     )
                 # Add other specific stop reason checks if needed (e.g., 'tool_use' if tools were involved)
                 else:
@@ -730,7 +937,16 @@ class AnthropicLLM(LLMInterface):
                 logger.error(
                     f"Anthropic response indicates an error stop reason. Response: {response}"
                 )
-                raise LLMResponseError("Anthropic API reported an error during generation.")
+                # Potentially check if error type indicates overload_error (related to context)
+                error_type = getattr(response, "error", {}).get("type")
+                if error_type == "overload_error":
+                    raise LLMResponseError(
+                        "Anthropic API Error: Overloaded, potentially due to exceeding context limits."
+                    )
+                else:
+                    raise LLMResponseError(
+                        f"Anthropic API reported an error during generation (Type: {error_type})."
+                    )
 
             return content
 
@@ -764,11 +980,27 @@ class AnthropicLLM(LLMInterface):
             logger.error(f"Anthropic API bad request error: {e}")
             # Try to get more details from the error if possible
             error_detail = str(e)
-            if hasattr(e, "body") and e.body and "error" in e.body and "message" in e.body["error"]:
-                error_detail = e.body["error"]["message"]
-            raise LLMResponseError(
-                f"Anthropic API reported a bad request (check message format/roles?). Error: {error_detail}"
-            ) from e
+            error_type = None
+            if hasattr(e, "body") and e.body and "error" in e.body:
+                error_type = e.body["error"].get("type")
+                if "message" in e.body["error"]:
+                    error_detail = e.body["error"]["message"]
+
+            # Check if the error indicates context length issues
+            if error_type == "invalid_request_error" and (
+                "prompt is too long" in error_detail or "exceeds the context window" in error_detail
+            ):
+                raise LLMResponseError(
+                    f"Anthropic API Error: Request likely exceeded context limit ({self._context_limit}). Details: {error_detail}"
+                ) from e
+            elif error_type == "overload_error":  # Sometimes context issues manifest as overload
+                raise LLMResponseError(
+                    f"Anthropic API Error: Overloaded, potentially due to context limit ({self._context_limit}). Details: {error_detail}"
+                ) from e
+            else:
+                raise LLMResponseError(
+                    f"Anthropic API reported a bad request (check message format/roles?). Type: {error_type}. Error: {error_detail}"
+                ) from e
         except self.anthropic.APIStatusError as e:  # Catch other 4xx/5xx
             logger.error(f"Anthropic API status error: {e.status_code} - {e.response}")
             error_detail = str(e)
@@ -784,10 +1016,57 @@ class AnthropicLLM(LLMInterface):
         except self.anthropic.AnthropicError as e:
             logger.error(f"An unexpected Anthropic client error occurred: {e}")
             raise LLMClientError(f"An unexpected Anthropic client error occurred: {e}") from e
+        # --- Allow specific LLMResponseErrors from validation to pass through ---
+        except LLMResponseError as e:
+            # This catches errors raised explicitly in the validation logic above
+            # (e.g., missing content)
+            logger.error(f"LLM Response Error: {e}")  # Log it, but let it propagate
+            raise
         # General exception catcher
         except Exception as e:
             logger.exception(f"An unexpected error occurred during Anthropic API call: {e}")
             raise LLMClientError(f"Unexpected error during Anthropic API call: {e}") from e
+
+    def count_tokens(self, text: str) -> int:
+        """Counts the number of tokens using the Anthropic SDK."""
+        try:
+            # Use the client instance's count_tokens method
+            token_count = self.client.count_tokens(text)
+            # Removed debug log
+            return token_count
+        except AttributeError:
+            logger.warning(
+                "Anthropic client does not have 'count_tokens' method (older version?). Falling back to approximation."
+            )
+        except Exception as e:
+            logger.error(
+                f"Error counting tokens with Anthropic SDK: {e}. Falling back to approximation."
+            )
+
+        # Fallback approximation (e.g., 4 chars per token)
+        estimated_tokens = len(text) // 4
+        logger.warning(
+            f"Using approximate token count: {estimated_tokens} (based on character count). Update 'anthropic' package for accuracy."
+        )
+        return estimated_tokens
+
+    def get_context_limit(self) -> int:
+        """Returns the context window size (in tokens) for the configured Anthropic model.
+
+        Note: These limits are currently hardcoded as the Anthropic API/SDK
+        does not provide a standard way to fetch them dynamically.
+        """
+        limit = self._context_limit  # Use the value set in __init__
+        logger.debug(f"Returning context limit for {self.model}: {limit} (Hardcoded)")
+        return limit
+
+
+GEMINI_CONTEXT_LIMITS = {
+    "gemini-1.5-flash-latest": 1048576,  # 1M context
+    "gemini-1.5-pro-latest": 1048576,  # 1M context (up to 2M available)
+    "gemini-1.0-pro": 32768,  # 32k context (includes input+output)
+}
+DEFAULT_GEMINI_CONTEXT_LIMIT = 32768
 
 
 class GeminiLLM(LLMInterface):
@@ -797,7 +1076,6 @@ class GeminiLLM(LLMInterface):
         "gemini-1.5-flash-latest",
         "gemini-1.5-pro-latest",
         "gemini-1.0-pro",
-        # Add older or specific versions if needed, e.g., "gemini-pro" (alias for 1.0)
     ]
 
     def __init__(
@@ -812,6 +1090,7 @@ class GeminiLLM(LLMInterface):
         """Initializes the Google Gemini client.
 
         Requires the 'google-generativeai' package (`pip install google-generativeai`).
+        Attempts to fetch the model's input/output token limits during initialization.
 
         Raises:
             LLMConfigurationError: If API key is missing, configuration fails, or client initialization fails.
@@ -1379,6 +1658,60 @@ class GeminiLLM(LLMInterface):
         else:
             logger.debug("System message unchanged for Gemini.")
 
+    def count_tokens(self, text: str) -> int:
+        """Counts the number of tokens using the Gemini SDK (model.count_tokens)."""
+        if not hasattr(self, "model") or self.model is None:
+            logger.error("Gemini model not initialized. Cannot count tokens.")
+            # Fall back to approximation if model isn't ready
+            estimated_tokens = len(text) // 4
+            logger.warning(
+                f"Using approximate token count: {estimated_tokens} (model not initialized)."
+            )
+            return estimated_tokens
+
+        try:
+            # Use the model instance's count_tokens method
+            # It requires the content to be tokenized (can be string, list of strings, or dict)
+            count_response = self.model.count_tokens(text)
+            token_count = count_response.total_tokens
+            logger.debug(
+                f"Counted {token_count} tokens for text (length {len(text)}) using Gemini SDK."
+            )
+            return token_count
+        except AttributeError:
+            logger.warning(
+                "Gemini model object does not have 'count_tokens' method (older version or initialization issue?). Falling back to approximation."
+            )
+        except self.google_exceptions.GoogleAPIError as e:
+            logger.error(
+                f"Gemini API error during token count: {e}. Falling back to approximation."
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error counting tokens with Gemini SDK: {e}. Falling back to approximation."
+            )
+
+        # Fallback approximation (e.g., 4 chars per token)
+        estimated_tokens = len(text) // 4
+        logger.warning(
+            f"Using approximate token count: {estimated_tokens} (based on character count). Check SDK version or API errors."
+        )
+        return estimated_tokens
+
+    def get_context_limit(self) -> int:
+        """Returns the context window size (in tokens) for the configured Gemini model."""
+        # Note: Gemini 1.5 models have large context, but actual usable input/output limits might vary.
+        # Gemini 1.0 limits often include both input and output tokens.
+        limit = GEMINI_CONTEXT_LIMITS.get(self.model_name)  # Use model_name which is normalized
+        if limit:
+            logger.debug(f"Context limit for {self.model_name}: {limit}")
+            return limit
+        else:
+            logger.warning(
+                f"Context limit not defined for Gemini model '{self.model_name}'. Returning default: {DEFAULT_GEMINI_CONTEXT_LIMIT}"
+            )
+            return DEFAULT_GEMINI_CONTEXT_LIMIT
+
 
 # --- Factory Function ---
 
@@ -1448,7 +1781,12 @@ def create_llm_client(
 
         # Instantiate the chosen provider class
         instance = provider_class(**client_args)
-        logger.info(f"Successfully created LLM client instance: {provider_class.__name__}")
+
+        # Get provider name safely - handles mocks in tests
+        provider_name = (
+            provider_class.__name__ if hasattr(provider_class, "__name__") else str(provider_class)
+        )
+        logger.info(f"Successfully created LLM client instance: {provider_name}")
         return instance
 
     except LLMConfigurationError as e:

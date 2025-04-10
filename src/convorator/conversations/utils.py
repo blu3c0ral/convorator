@@ -6,11 +6,11 @@ from typing import Any, Callable, Dict, Optional, TypeVar, Union, get_args, get_
 
 import jsonschema
 
-from convorator.conversations.conversation_setup import LLMResponseError, SchemaValidationError
-from convorator.exceptions import MissingVariableError
+# Import exceptions from the central location
+from convorator.exceptions import MissingVariableError, LLMResponseError, SchemaValidationError
 
 
-def validate_json(logger: logging.Logger, data: Dict, schema: Dict) -> str:
+def validate_json(logger: logging.Logger, data: Dict, schema: Dict) -> None:
     """
     Validate JSON data against a given schema.
 
@@ -20,21 +20,23 @@ def validate_json(logger: logging.Logger, data: Dict, schema: Dict) -> str:
         schema (dict): JSON schema for validation
 
     Raises:
-        jsonschema.exceptions.SchemaError: If the schema itself is invalid
+        SchemaValidationError: If validation fails.
+        jsonschema.exceptions.SchemaError: If the schema itself is invalid.
     """
     try:
         # Validate the data against the schema
         jsonschema.validate(instance=data, schema=schema)
         logger.debug("JSON validation successful.")
     except jsonschema.exceptions.ValidationError as validation_err:
-        error_msg = f"JSON Validation Error: {validation_err.message} in instance {validation_err.instance}. Schema path: {list(validation_err.schema_path)}"
+        # Construct a more informative error message
+        error_msg = f"JSON Validation Error: {validation_err.message} at path '{'/'.join(map(str, validation_err.path))}'. Schema path: '{'/'.join(map(str, validation_err.schema_path))}'. Instance snippet: {str(validation_err.instance)[:100]}..."
         logger.error(error_msg)
-        # Wrap the original validation error
-        raise SchemaValidationError(error_msg, validation_error=validation_err)
+        # Wrap the original validation error in our custom exception
+        raise SchemaValidationError(error_msg, schema=schema, instance=data) from validation_err
     except jsonschema.exceptions.SchemaError as schema_err:
-        # Schema errors are usually programmer errors, re-raise directly
+        # Schema errors are usually programmer errors, re-raise directly but log
         logger.error(f"Invalid JSON Schema provided: {schema_err}", exc_info=True)
-        raise
+        raise  # Re-raise the original SchemaError
 
 
 def parse_json_response(
@@ -64,10 +66,12 @@ def parse_json_response(
     result_json = None
     try:
         # Try to find JSON within ```json ... ``` blocks first
-        json_match = re.search(r"```json\s*([\s\S]*?)\s*```", response, re.IGNORECASE)
-        if json_match:
-            json_str = json_match.group(1).strip()
-            logger.debug(f"Found JSON in ```json block: {json_str[:100]}...")
+        # Use findall to get all non-overlapping matches
+        json_matches = re.findall(r"```json\s*([\s\S]*?)\s*```", response, re.IGNORECASE)
+        if json_matches:
+            # Use the last match found
+            json_str = json_matches[-1].strip()
+            logger.debug(f"Found JSON in last ```json block: {json_str[:100]}...")
             result_json = json.loads(json_str)
         else:
             # If no block found, try to find the first valid JSON object/array
@@ -109,62 +113,13 @@ def parse_json_response(
         raise
     except jsonschema.exceptions.SchemaError:  # Re-raise schema definition errors
         raise
-    except Exception as e:  # Catch unexpected errors during parsing
+    except Exception as e:  # Catch other unexpected errors during parsing
+        # Avoid wrapping errors we already handle specifically
+        if isinstance(e, (LLMResponseError, SchemaValidationError)):
+            raise
         error_msg = f"Unexpected error parsing JSON in {context}: {e}"
         logger.error(error_msg, exc_info=True)
         raise LLMResponseError(error_msg, original_exception=e)
-
-
-T = TypeVar("T")
-
-
-def execute_with_locals(func: Callable[..., T]) -> T:
-    """
-    Call a function with arguments extracted from a dictionary of local variables.
-
-    Intelligently handles optional parameters:
-    - Parameters with default values
-    - Parameters with Optional[] type hints
-    - Parameters with default value None
-
-    Args:
-        func: The function to call
-
-    Returns:
-        The result of calling the function with matched parameters
-    """
-    # Get the current stack frame
-    stack = inspect.stack()
-    # stack[0] is the current function
-    # stack[1] is the immediate caller
-    caller = stack[1]
-    # Get caller local variables
-    local_vars = caller.frame.f_locals
-
-    # Get function signature
-    sig = inspect.signature(func)
-
-    # Build arguments dict by matching parameter names with local variables
-    args = {}
-    for param_name, param in sig.parameters.items():
-        if param_name in local_vars:
-            # Local variable exists, use it regardless of optionality
-            args[param_name] = local_vars[param_name]
-        elif param.default is not param.empty:
-            # Parameter has default value, so it's optional - skip it
-            continue
-        elif is_optional_type(param):
-            # Parameter has Optional[] type hint but no default - it's still optional
-            continue
-        else:
-            # Required parameter is missing
-            raise MissingVariableError(
-                f"Missing required variable '{param_name}' in locals() for function '{func.__name__}' called from {caller.function} in {caller.filename} at line {caller.lineno}."
-                f" Locals: {local_vars}"
-            )
-
-    # Call the function with the collected arguments
-    return func(**args)
 
 
 def is_optional_type(param: inspect.Parameter) -> bool:
