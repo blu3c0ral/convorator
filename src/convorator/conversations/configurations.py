@@ -1,34 +1,25 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-import logging
 from typing import Any, Callable, Dict, Optional, Union
 
 from convorator.client.llm_client import LLMInterface
+from convorator.conversations.events import MessagingCallback
 from convorator.conversations.state import MultiAgentConversation
+
+from convorator.utils.logger import setup_logger
 
 # Import shared types from types.py
 from convorator.conversations.types import (
     LoggerProtocol,
     SolutionLLMGroup,  # Moved to types.py
-    PromptBuilderInputs,  # Needed for PromptBuilderFunction type hint indirectly
     PromptBuilderFunction,  # Type alias for prompt functions
 )
 
 # Import default prompt function implementations for default_factory
-from convorator.conversations.prompts import (
-    default_build_initial_prompt,
-    default_build_debate_user_prompt,
-    default_build_moderator_context,
-    default_build_moderator_instructions,  # Note: This is the *role* instruction now
-    default_build_primary_prompt,
-    default_build_debater_prompt,
-    default_build_summary_prompt,
-    default_build_improvement_prompt,
-    default_build_fix_prompt,
-)
+from convorator.conversations.prompts import PromptBuilder
 
-# Removed SolutionLLMGroup definition (moved to types.py)
-# Removed PromptBuilderFunctions definition (no longer needed)
+# Import default callback
+from .callbacks import DefaultFileResponseLogger
 
 
 # --- Core Process Configuration ---
@@ -52,30 +43,18 @@ class OrchestratorConfig:
     solution_schema: Optional[Dict[str, Any]] = None
 
     # --- Customization ---
-    logger: LoggerProtocol = field(default_factory=lambda: logging.getLogger(__name__))
+    logger: LoggerProtocol = field(default_factory=lambda: setup_logger(__name__))
+    messaging_callback: Optional[MessagingCallback] = field(
+        default_factory=DefaultFileResponseLogger
+    )
 
     # User-provided context/instructions (Optional)
     moderator_instructions_override: Optional[str] = None  # For the moderator *context* prompt
     debate_context_override: Optional[str] = None  # Background context
 
     # --- Prompt Builder Functions (with defaults) ---
-    # Renamed build_moderator_instructions to build_moderator_role_instructions
-    # Added build_moderator_context_instructions to differentiate
-    build_initial_prompt: PromptBuilderFunction = field(default=default_build_initial_prompt)
-    build_debate_user_prompt: PromptBuilderFunction = field(
-        default=default_build_debate_user_prompt
-    )
-    build_moderator_context: PromptBuilderFunction = field(default=default_build_moderator_context)
-    build_moderator_role_instructions: PromptBuilderFunction = field(
-        default=default_build_moderator_instructions
-    )  # System message for moderator
-    build_primary_prompt: PromptBuilderFunction = field(default=default_build_primary_prompt)
-    build_debater_prompt: PromptBuilderFunction = field(default=default_build_debater_prompt)
-    build_summary_prompt: PromptBuilderFunction = field(default=default_build_summary_prompt)
-    build_improvement_prompt: PromptBuilderFunction = field(
-        default=default_build_improvement_prompt
-    )
-    build_fix_prompt: PromptBuilderFunction = field(default=default_build_fix_prompt)
+    prompt_builder: PromptBuilder = field(default_factory=PromptBuilder)
+    session_id: Optional[str] = None  # Added for session tracking
 
     def __post_init__(self):
         """Validate configuration after initialization."""

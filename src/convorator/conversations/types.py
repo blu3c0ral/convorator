@@ -1,6 +1,5 @@
 from __future__ import annotations
-import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Protocol
 
 from convorator.client.llm_client import LLMInterface
@@ -32,7 +31,7 @@ class PromptBuilderInputs:
     # --- Fields WITH defaults follow ---
     topic: Optional[str] = None
     llm_group: Optional[SolutionLLMGroup] = None
-    solution_schema: Optional[Dict] = None
+    solution_schema: Optional[Dict[str, Any]] = None
     initial_solution: Optional[str] = None
     requirements: Optional[str] = None
     assessment_criteria: Optional[str] = None
@@ -47,6 +46,8 @@ class PromptBuilderInputs:
     moderator_summary: Optional[str] = None  # Output of the summary step
     response_to_fix: Optional[str] = None  # Last LLM response if it failed validation
     errors_to_fix: Optional[str] = None  # Validation errors for the failed response
+    debate_iterations: int = 3
+    current_iteration_num: int = 0
 
 
 # Define the type alias for prompt building functions AFTER PromptBuilderInputs is defined

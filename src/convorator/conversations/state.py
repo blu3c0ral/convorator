@@ -2,29 +2,11 @@
 
 """Manages conversation state for multi-agent interactions."""
 
-from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 # Assuming standard project structure
-try:
-    from convorator.client.llm_client import Message
-    from convorator.utils.logger import setup_logger
-except ImportError:
-    # Basic fallbacks if running standalone or structure differs
-    import logging
-    from dataclasses import dataclass
-
-    setup_logger = lambda name: logging.getLogger(name)
-
-    @dataclass
-    class Message:
-        role: str
-        content: str
-
-        def to_dict(self) -> Dict[str, str]:
-            return {"role": self.role, "content": self.content}
-
-    logging.warning("Using fallback logger and Message class for state.py")
+from convorator.client.llm_client import Message
+from convorator.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -128,5 +110,32 @@ class MultiAgentConversation:
         """
         return any(message.role == "system" for message in self.messages)
 
-    # Removed switch_traditional_conversation_roles as it seems less relevant
-    # for a multi-agent log with specific role names.
+    def print_conversation(self) -> None:
+        """Prints the conversation in a readable format with colors."""
+        RED = "\033[91m"
+        GREEN = "\033[92m"
+        WHITE = "\033[0m"  # Reset color
+
+        print(f"{RED}Multi-Agent Conversation:{WHITE}")
+        for message in self.messages:
+            print(f"{GREEN}{message.role}:{WHITE} {message.content}")
+        print(f"{RED}End of Multi-Agent Conversation.{WHITE}\n")
+
+    # Provide a function that returns the nth message of a role in the messages from the end (first message is the last message)
+    def get_nth_message_from_role(self, role: str, n: int) -> Optional[Message]:
+        """
+        Get the nth message from a specific role.
+
+        Args:
+            role (str): The role to look for.
+            n (int): The index of the message to retrieve.
+
+        Returns:
+            Optional[Message]: The nth message from the role, or None if not found.
+        """
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].role == role:
+                if n == 0:
+                    return self.messages[i]
+                n -= 1
+        return None

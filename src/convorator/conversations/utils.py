@@ -2,15 +2,20 @@ import inspect
 import json
 import logging
 import re
-from typing import Any, Callable, Dict, Optional, TypeVar, Union, get_args, get_origin
+from typing import Dict, Optional, Union, get_args, get_origin
 
 import jsonschema
 
+from jsonschema.exceptions import ValidationError, SchemaError
+
+
 # Import exceptions from the central location
-from convorator.exceptions import MissingVariableError, LLMResponseError, SchemaValidationError
+from convorator.exceptions import LLMResponseError, SchemaValidationError
+
+Schema = Dict[str, object]
 
 
-def validate_json(logger: logging.Logger, data: Dict, schema: Dict) -> None:
+def validate_json(logger: logging.Logger, data: Dict[str, object], schema: Schema) -> None:
     """
     Validate JSON data against a given schema.
 
@@ -27,13 +32,13 @@ def validate_json(logger: logging.Logger, data: Dict, schema: Dict) -> None:
         # Validate the data against the schema
         jsonschema.validate(instance=data, schema=schema)
         logger.debug("JSON validation successful.")
-    except jsonschema.exceptions.ValidationError as validation_err:
+    except ValidationError as validation_err:
         # Construct a more informative error message
         error_msg = f"JSON Validation Error: {validation_err.message} at path '{'/'.join(map(str, validation_err.path))}'. Schema path: '{'/'.join(map(str, validation_err.schema_path))}'. Instance snippet: {str(validation_err.instance)[:100]}..."
         logger.error(error_msg)
         # Wrap the original validation error in our custom exception
         raise SchemaValidationError(error_msg, schema=schema, instance=data) from validation_err
-    except jsonschema.exceptions.SchemaError as schema_err:
+    except SchemaError as schema_err:
         # Schema errors are usually programmer errors, re-raise directly but log
         logger.error(f"Invalid JSON Schema provided: {schema_err}", exc_info=True)
         raise  # Re-raise the original SchemaError
@@ -43,8 +48,8 @@ def parse_json_response(
     logger: logging.Logger,
     response: str,
     context: str,
-    schema: Optional[Dict] = None,
-) -> Dict:
+    schema: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
     """
     Robustly parse JSON from LLM response and validate against schema if provided.
 
@@ -111,7 +116,7 @@ def parse_json_response(
         raise LLMResponseError(error_msg, original_exception=e)
     except SchemaValidationError:  # Re-raise schema validation errors
         raise
-    except jsonschema.exceptions.SchemaError:  # Re-raise schema definition errors
+    except SchemaError:  # Re-raise schema definition errors
         raise
     except Exception as e:  # Catch other unexpected errors during parsing
         # Avoid wrapping errors we already handle specifically

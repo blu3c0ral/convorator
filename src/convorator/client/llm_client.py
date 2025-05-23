@@ -203,6 +203,7 @@ class LLMInterface(ABC):
     conversation: Conversation
     _system_message: Optional[str]  # Stored desired system message
     _role_name: Optional[str]  # Optional name for the assistant role
+    max_tokens: int
 
     @abstractmethod
     def _call_api(self, messages: List[Dict[str, str]]) -> str:
@@ -382,8 +383,21 @@ class LLMInterface(ABC):
 # --- Concrete LLM Client Implementations ---
 
 
-# Default context limit fallback if API fetch fails
-DEFAULT_CONTEXT_LIMIT_FALLBACK = 8192
+OPENAI_CONTEXT_LIMITS: Dict[str, Optional[int]] = {
+    "gpt-4o": 128000,  # Standard context window with max output of 16,384 tokens
+    "gpt-4o-mini": 128000,  # Same context window as standard GPT-4o
+    "gpt-4o-long-output": 128000,  # With up to 64,000 tokens of output
+    "gpt-4-turbo": 128000,
+    "gpt-4": 8192,
+    "gpt-3.5-turbo": 16384,
+    "gpt-4.5-orion": 256000,  # Based on leaked/announced info
+    "o3-mini": 200000,  # Based on references, but with reported limitations
+    "o3": 200000,  # Based on available information
+    "o1-preview": None,  # No definitive information found
+}
+DEFAULT_OPENAI_CONTEXT_LIMIT = min(
+    [limit for limit in OPENAI_CONTEXT_LIMITS.values() if limit is not None]
+)
 
 
 class OpenAILLM(LLMInterface):
@@ -496,39 +510,24 @@ class OpenAILLM(LLMInterface):
         )
 
         # Fetch context limit during initialization
-        self._context_limit = self._fetch_context_limit()
-
-    def _fetch_context_limit(self) -> int:
-        """Fetches the context window size (in tokens) for the current model from the OpenAI API.
-
-        Returns:
-            int: The context window size in tokens, or a fallback value if the fetch fails.
-        """
-        try:
-            model_info = self.client.models.retrieve(self.model)
-            context_window = getattr(model_info, "context_window", None)
-            if context_window:
-                logger.debug(
-                    f"Successfully fetched context limit for {self.model}: {context_window}"
-                )
-                return context_window
-            else:
-                logger.warning(
-                    f"Could not find context_window attribute for {self.model}. Using fallback."
-                )
-                return DEFAULT_CONTEXT_LIMIT_FALLBACK
-        except self.openai.NotFoundError as e:
+        self._context_limit = (
+            OPENAI_CONTEXT_LIMITS.get(self.model, DEFAULT_OPENAI_CONTEXT_LIMIT)
+            or DEFAULT_OPENAI_CONTEXT_LIMIT
+        )
+        if self.model not in OPENAI_CONTEXT_LIMITS:
             logger.warning(
-                f"Model {self.model} not found during context limit fetch: {e}. Using fallback."
+                f"Context limit not defined for OpenAI model '{self.model}'. Using default: {self._context_limit}"
             )
-            return DEFAULT_CONTEXT_LIMIT_FALLBACK
-        except (
-            self.openai.APIConnectionError,
-            self.openai.RateLimitError,
-            self.openai.APIStatusError,
-        ) as e:
-            logger.warning(f"Error fetching context limit for {self.model}: {e}. Using fallback.")
-            return DEFAULT_CONTEXT_LIMIT_FALLBACK
+
+        # Check max_tokens against the known limit
+        if self.max_tokens > self._context_limit:
+            logger.warning(
+                f"Requested max_tokens ({self.max_tokens}) exceeds the known context limit ({self._context_limit}) for model '{self.model}'. API calls might fail."
+            )
+        elif self.max_tokens > self._context_limit * 0.8:
+            logger.info(
+                f"Requested max_tokens ({self.max_tokens}) is close to the context limit ({self._context_limit}). Ensure input + output fits."
+            )
 
     def _get_tiktoken_encoding(self):
         """Lazily loads and returns the tiktoken encoding for the current model."""
@@ -715,14 +714,20 @@ class OpenAILLM(LLMInterface):
 
 
 ANTHROPIC_CONTEXT_LIMITS = {
-    "claude-3-opus-20240229": 200000,
-    "claude-3-sonnet-20240229": 200000,
-    "claude-3-haiku-20240307": 200000,
+    "claude-3-opus": 200000,
+    "claude-3-sonnet": 200000,
+    "claude-3-haiku": 200000,
+    "claude-3.5-sonnet": 200000,
+    "claude-3.5-haiku": 200000,
+    "claude-3.7-sonnet": 200000,  # With extended output of up to 128K tokens
+    "claude-3.7-sonnet-500k": 500000,  # Upcoming model based on leaked info
     "claude-2.1": 200000,
     "claude-2.0": 100000,
     "claude-instant-1.2": 100000,
 }
-DEFAULT_ANTHROPIC_CONTEXT_LIMIT = 100000  # Fallback
+DEFAULT_ANTHROPIC_CONTEXT_LIMIT = min(
+    [limit for limit in ANTHROPIC_CONTEXT_LIMITS.values() if limit is not None]
+)
 
 
 class AnthropicLLM(LLMInterface):
@@ -868,7 +873,9 @@ class AnthropicLLM(LLMInterface):
         try:
             response = self.client.messages.create(
                 model=self.model,
-                system=system_prompt if system_prompt else None,  # Pass system prompt here
+                system=(
+                    system_prompt if system_prompt else ""
+                ),  # Pass system prompt here. Workaround: if None, place empty string.
                 messages=filtered_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -1062,9 +1069,17 @@ class AnthropicLLM(LLMInterface):
 
 
 GEMINI_CONTEXT_LIMITS = {
-    "gemini-1.5-flash-latest": 1048576,  # 1M context
-    "gemini-1.5-pro-latest": 1048576,  # 1M context (up to 2M available)
-    "gemini-1.0-pro": 32768,  # 32k context (includes input+output)
+    "gemini-2.5-pro": 1000000,  # 1M token with 2M announced as "coming soon"
+    "gemini-2.0-pro": 2000000,  # Largest context window at 2M tokens
+    "gemini-2.0-flash": 1000000,  # 1M token context window
+    "gemini-2.0-flash-lite": 1000000,  # Same 1M token context as 2.0 Flash
+    "gemini-1.5-pro": 2000000,  # Updated to 2M tokens
+    "gemini-1.5-flash": 1000000,  # Standard 1M token context
+    "gemini-1.5-flash-8b": 1000000,  # Lower cost variant introduced Oct 2024
+    "gemini-1.0-ultra": 32000,
+    "gemini-1.0-pro": 32000,
+    "gemma-3": 128000,  # New open model with 128K context window
+    "gemma-2": None,  # Context window size not specified in search results
 }
 DEFAULT_GEMINI_CONTEXT_LIMIT = 32768
 
@@ -1724,6 +1739,17 @@ _PROVIDER_MAP = {
     "claude": AnthropicLLM,
     "google": GeminiLLM,
 }
+
+
+@dataclass
+class LLMClientConfig:
+    client_type: str
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    temperature: float = DEFAULT_TEMPERATURE
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    system_message: Optional[str] = None
+    role_name: Optional[str] = None
 
 
 def create_llm_client(
