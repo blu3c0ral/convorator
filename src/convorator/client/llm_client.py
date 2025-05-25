@@ -1,4 +1,6 @@
 # llm_client.py
+from __future__ import annotations
+
 """
 llm_client: Unified Interface for Large Language Model APIs
 
@@ -51,43 +53,22 @@ TODO: Provider API versioning and compatibility checks
 """
 
 import os
-import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
+
+# from openai.resources.chat.completions import
+
 
 # Assuming standard project structure where 'convorator' is a top-level package
-try:
-    from convorator.utils.logger import setup_logger
-    from convorator.exceptions import (
-        LLMClientError,
-        LLMConfigurationError,
-        LLMResponseError,
-    )
-    import tiktoken  # Add tiktoken import
-except ImportError:
-    # Fallback for running the script directly or if structure differs
-    import logging
 
-    setup_logger = lambda name: logging.getLogger(name)  # Basic logger fallback
-
-    # Define basic exceptions if import fails (not ideal for production)
-    class LLMClientError(Exception):
-        """Base class for LLM client errors."""
-
-        pass
-
-    class LLMConfigurationError(LLMClientError):
-        """Raised when there are configuration issues (API keys, model names, etc.)."""
-
-        pass
-
-    # Define tiktoken as None if it couldn't be imported
-    tiktoken = None
-
-    logging.warning(
-        "Could not import from convorator package or tiktoken. Using basic logging and exception definitions. Token counting may be approximate."
-    )
+from convorator.utils.logger import setup_logger
+from convorator.exceptions import (
+    LLMClientError,
+    LLMConfigurationError,
+    LLMResponseError,
+)
+import tiktoken  # Add tiktoken import
 
 
 logger = setup_logger("llm_client")  # Use a specific logger name
@@ -115,7 +96,7 @@ class Message:
 class Conversation:
     """Manages the conversation history for an LLM interaction."""
 
-    messages: List[Message] = field(default_factory=list)
+    messages: List[Message] = field(default_factory=list)  # type: ignore
     system_message: Optional[str] = None  # Stores the intended system message content
 
     def __post_init__(self):
@@ -259,7 +240,9 @@ class LLMInterface(ABC):
             if use_conversation:
                 # --- Stateful Query ---
                 # Ensure the internal conversation object has the correct system message
-                if self._system_message != self.conversation.system_message:
+                if (self._system_message is not None) and (
+                    self._system_message != self.conversation.system_message
+                ):
                     self.conversation.add_message(role="system", content=self._system_message)
 
                 # Add the current user prompt to the internal conversation
@@ -361,7 +344,7 @@ class LLMInterface(ABC):
 
     def set_system_message(self, message: Optional[str]):
         """Sets or updates the system message for subsequent queries."""
-        if message != self._system_message:
+        if (message is not None) and (message != self._system_message):
             logger.debug(f"Setting system message to: '{message}'")
             self._system_message = message
             # Update the conversation object immediately if it exists
@@ -532,12 +515,6 @@ class OpenAILLM(LLMInterface):
     def _get_tiktoken_encoding(self):
         """Lazily loads and returns the tiktoken encoding for the current model."""
         if self._encoding is None:
-            if tiktoken is None:
-                logger.warning(
-                    "'tiktoken' library not found. Cannot accurately count tokens for OpenAI. Install using 'pip install tiktoken'"
-                )
-                return None  # Indicate failure to load
-
             encoding_name = self.MODEL_TO_ENCODING.get(self.model, self.DEFAULT_ENCODING)
             if encoding_name != self.DEFAULT_ENCODING and self.model not in self.MODEL_TO_ENCODING:
                 logger.warning(
@@ -572,10 +549,11 @@ class OpenAILLM(LLMInterface):
         logger.debug(
             f"Calling OpenAI API ({self.model}) with {len(messages)} messages. First message role: {messages[0].get('role')}"
         )
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=messages,  # API expects list of {'role': str, 'content': str}
+                messages=messages,  # type: ignore  # API expects list of {'role': str, 'content': str}
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
@@ -713,7 +691,7 @@ class OpenAILLM(LLMInterface):
         return self._context_limit
 
 
-ANTHROPIC_CONTEXT_LIMITS = {
+ANTHROPIC_CONTEXT_LIMITS: Dict[str, Optional[int]] = {
     "claude-3-opus": 200000,
     "claude-3-sonnet": 200000,
     "claude-3-haiku": 200000,
@@ -780,8 +758,9 @@ class AnthropicLLM(LLMInterface):
         self.temperature = temperature
         self.max_tokens = max_tokens
         # Get context limit from hardcoded dict
-        self._context_limit = ANTHROPIC_CONTEXT_LIMITS.get(
-            self.model, DEFAULT_ANTHROPIC_CONTEXT_LIMIT
+        self._context_limit = (
+            ANTHROPIC_CONTEXT_LIMITS.get(self.model, DEFAULT_ANTHROPIC_CONTEXT_LIMIT)
+            or DEFAULT_ANTHROPIC_CONTEXT_LIMIT
         )
         if self.model not in ANTHROPIC_CONTEXT_LIMITS:
             logger.warning(
@@ -802,6 +781,8 @@ class AnthropicLLM(LLMInterface):
             logger.info(
                 f"Requested max_tokens ({self.max_tokens}) is close to the context limit ({self._context_limit}). Ensure input + output fits."
             )
+        else:
+            logger.warning("No context limit defined for Anthropic API.")
 
         self._system_message = system_message
         self._role_name = role_name or "Assistant"
@@ -815,7 +796,7 @@ class AnthropicLLM(LLMInterface):
         """Calls the Anthropic Messages API."""
         system_prompt = self._system_message  # System prompt is passed separately
         # Filter out system message from history, ensure roles are 'user'/'assistant'
-        filtered_messages = []
+        filtered_messages: List[Dict[str, str]] = []
         approx_input_tokens = 0  # Estimate input tokens
         for msg in messages:
             role = msg.get("role")
@@ -876,7 +857,7 @@ class AnthropicLLM(LLMInterface):
                 system=(
                     system_prompt if system_prompt else ""
                 ),  # Pass system prompt here. Workaround: if None, place empty string.
-                messages=filtered_messages,
+                messages=filtered_messages,  # type: ignore
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
@@ -898,7 +879,7 @@ class AnthropicLLM(LLMInterface):
                     )
 
             # Content is a list of blocks, usually one text block for simple chat
-            if not isinstance(response.content, list) or len(response.content) == 0:
+            if len(response.content) == 0:
                 logger.error(
                     f"Anthropic response 'content' is not a non-empty list. Type: {type(response.content)}. Response: {response}"
                 )
@@ -907,8 +888,8 @@ class AnthropicLLM(LLMInterface):
                 )
 
             # Extract text from the first text block if available
-            content_text = None
-            if hasattr(response.content[0], "text"):
+            content_text: Optional[str] = None
+            if hasattr(response.content[0], "type") and (response.content[0].type == "text"):
                 content_text = response.content[0].text
 
             if content_text is None:
@@ -988,10 +969,11 @@ class AnthropicLLM(LLMInterface):
             # Try to get more details from the error if possible
             error_detail = str(e)
             error_type = None
-            if hasattr(e, "body") and e.body and "error" in e.body:
-                error_type = e.body["error"].get("type")
-                if "message" in e.body["error"]:
-                    error_detail = e.body["error"]["message"]
+            if hasattr(e, "body") and isinstance(e.body, Dict):
+                if "error" in e.body:  # type: ignore
+                    error_type = e.body["error"].get("type")  # type: ignore
+                if "message" in e.body["error"]:  # type: ignore
+                    error_detail = e.body["error"]["message"]  # type: ignore
 
             # Check if the error indicates context length issues
             if error_type == "invalid_request_error" and (
@@ -1038,9 +1020,10 @@ class AnthropicLLM(LLMInterface):
         """Counts the number of tokens using the Anthropic SDK."""
         try:
             # Use the client instance's count_tokens method
-            token_count = self.client.count_tokens(text)
+            messages: List[Dict[str, str]] = [{"role": "user", "content": text}]
+            token_count = self.client.beta.messages.count_tokens(messages=messages, model=self.model)  # type: ignore
             # Removed debug log
-            return token_count
+            return token_count.input_tokens
         except AttributeError:
             logger.warning(
                 "Anthropic client does not have 'count_tokens' method (older version?). Falling back to approximation."
@@ -1068,7 +1051,7 @@ class AnthropicLLM(LLMInterface):
         return limit
 
 
-GEMINI_CONTEXT_LIMITS = {
+GEMINI_CONTEXT_LIMITS: Dict[str, Optional[int]] = {
     "gemini-2.5-pro": 1000000,  # 1M token with 2M announced as "coming soon"
     "gemini-2.0-pro": 2000000,  # Largest context window at 2M tokens
     "gemini-2.0-flash": 1000000,  # 1M token context window
@@ -1131,7 +1114,7 @@ class GeminiLLM(LLMInterface):
 
         try:
             # Configure the API key globally for the genai module
-            self.genai.configure(api_key=self.api_key)
+            self.genai.configure(api_key=self.api_key)  # type: ignore
             logger.info("Google Generative AI SDK configured successfully.")
         except Exception as e:
             # Catch potential issues during configure()
@@ -1159,6 +1142,20 @@ class GeminiLLM(LLMInterface):
                 # top_p=... # Optional nucleus sampling
                 # top_k=... # Optional top-k sampling
             )
+        except AttributeError as e:
+            # Fallback if self.genai.types.GenerationConfig is not found, try self.genai.GenerationConfig
+            logger.warning(
+                f"Accessing GenerationConfig via self.genai.types.GenerationConfig failed ({e}), trying self.genai.GenerationConfig."
+            )
+            try:
+                self.generation_config = self.genai.GenerationConfig(  # type: ignore
+                    max_output_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                )
+            except Exception as e_inner:
+                raise LLMConfigurationError(
+                    f"Failed to create Gemini GenerationConfig: {e_inner}"
+                ) from e_inner
         except Exception as e:
             # Catch potential errors creating GenerationConfig (e.g., invalid values)
             raise LLMConfigurationError(f"Failed to create Gemini GenerationConfig: {e}") from e
@@ -1166,12 +1163,25 @@ class GeminiLLM(LLMInterface):
         # Define safety settings (adjust as needed)
         # Defaults are generally BLOCK_MEDIUM_AND_ABOVE for most categories.
         # Setting to BLOCK_NONE disables safety filtering for that category (USE WITH CAUTION).
-        self.safety_settings = {
-            # Example: Relax harassment slightly (BLOCK_ONLY_HIGH)
-            # self.genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: self.genai.types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            # Example: Disable hate speech filter (BLOCK_NONE) - Use responsibly!
-            # self.genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: self.genai.types.HarmBlockThreshold.BLOCK_NONE,
-        }
+        # Access HarmCategory and HarmBlockThreshold via self.genai.types
+        try:
+            self.safety_settings: Dict[Any, Any] = {
+                # Example: Relax harassment slightly (BLOCK_ONLY_HIGH)
+                # self.genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: self.genai.types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                # Example: Disable hate speech filter (BLOCK_NONE) - Use responsibly!
+                # self.genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: self.genai.types.HarmBlockThreshold.BLOCK_NONE,
+            }
+            # Example of correctly accessing an enum if needed for validation or dynamic setup:
+            # _ = self.genai.types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT
+        except AttributeError as e:
+            logger.warning(
+                f"Could not access safety setting enums via self.genai.types (e.g., HarmCategory): {e}. Safety settings might not be configurable with these enums."
+            )
+            self.safety_settings = {}  # Fallback to empty if enums are not found as expected
+        except Exception as e:
+            logger.error(f"Unexpected error during safety_settings definition: {e}")
+            self.safety_settings = {}
+
         if self.safety_settings:
             logger.warning(
                 f"Using custom safety settings for Gemini: {self.safety_settings}. Be aware of the implications."
@@ -1672,6 +1682,46 @@ class GeminiLLM(LLMInterface):
                 ) from e
         else:
             logger.debug("System message unchanged for Gemini.")
+
+    def set_safety_settings(self, safety_settings: Optional[Dict[Any, Any]]):
+        """
+        Sets or updates the safety settings for the Gemini model.
+        This will re-initialize the underlying GenerativeModel and reset any active chat session.
+
+        Args:
+            safety_settings: A dictionary mapping HarmCategory enums to HarmBlockThreshold enums.
+                             If None, it defaults to an empty dictionary (provider defaults).
+        """
+        new_settings = safety_settings if safety_settings is not None else {}
+
+        if new_settings != self.safety_settings:
+            logger.info("Safety settings changing for Gemini. Re-initializing GenerativeModel.")
+            self.safety_settings = new_settings
+            try:
+                # Re-initialize the model with the new safety settings
+                self.model = self.genai.GenerativeModel(
+                    model_name=self.model_name,
+                    generation_config=self.generation_config,
+                    safety_settings=self.safety_settings,
+                    system_instruction=self._system_message if self._system_message else None,
+                )
+                # Reset any existing chat session as its context is now based on the old safety settings
+                self.chat = None
+                logger.info(
+                    f"Gemini GenerativeModel re-initialized with new safety settings: {self.safety_settings}"
+                )
+            except Exception as e:
+                # Log error but try to continue; state might be inconsistent.
+                # Consider reverting self.safety_settings to its previous state if critical.
+                logger.exception(
+                    f"Failed to re-initialize Gemini GenerativeModel after safety settings change: {e}"
+                )
+                # Raise config error as the client might be in an unusable state regarding safety settings.
+                raise LLMConfigurationError(
+                    f"Failed to re-initialize Gemini model after safety settings change: {e}"
+                ) from e
+        else:
+            logger.debug(f"Safety settings unchanged for Gemini. Current: {self.safety_settings}")
 
     def count_tokens(self, text: str) -> int:
         """Counts the number of tokens using the Gemini SDK (model.count_tokens)."""

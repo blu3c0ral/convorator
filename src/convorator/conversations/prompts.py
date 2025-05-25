@@ -1,3 +1,6 @@
+# src/convorator/conversations/prompts.py
+from __future__ import annotations
+
 # Default System Messages for Orchestrator Roles
 
 DEFAULT_PRIMARY_AGENT_SYSTEM_MESSAGE = (
@@ -50,8 +53,6 @@ DEFAULT_SOLUTION_GENERATION_AGENT_SYSTEM_MESSAGE = (
     "Be precise and avoid any extraneous information in your output. "
 )
 
-# src/convorator/conversations/prompts.py
-from __future__ import annotations
 from functools import wraps
 import json
 from typing import Callable, Dict, Optional

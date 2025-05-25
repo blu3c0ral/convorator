@@ -1,8 +1,7 @@
 import logging
 import sys
 import os
-from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 import time
 from functools import wraps
 
@@ -51,9 +50,7 @@ def setup_logger(
         logger.handlers.clear()
 
     # Create formatter
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 
     # Add file handler
     file_handler = logging.FileHandler(log_file)
@@ -82,14 +79,14 @@ def cleanup_logger(name: str):
     logger.handlers.clear()
 
 
-def get_all_loggers():
+def get_all_loggers() -> list[str]:
     """
     Get all logger instances that have been created.
 
     Returns:
         list: Names of all loggers with handlers
     """
-    loggers = []
+    loggers: list[str] = []
 
     # Get the logger manager dictionary that contains all loggers
     logger_dict = logging.Logger.manager.loggerDict
@@ -153,7 +150,9 @@ def configure_structured_logging():
 
 
 # Simple performance timing decorator
-def time_function(logger=None):
+def time_function(
+    logger: Optional[logging.Logger] = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """
     Decorator to time function execution.
 
@@ -164,9 +163,9 @@ def time_function(logger=None):
         Decorated function
     """
 
-    def decorator(func):
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             start_time = time.time()
             result = func(*args, **kwargs)
             elapsed = time.time() - start_time
@@ -184,7 +183,9 @@ def time_function(logger=None):
 
 
 # Initialize metrics for prometheus (if needed)
-def setup_prometheus_metrics(export_port=8000):
+def setup_prometheus_metrics(
+    export_port: int = 8000,
+) -> dict[str, prometheus_client.Summary | prometheus_client.Counter]:
     """
     Set up Prometheus metrics exporter.
 
@@ -198,7 +199,7 @@ def setup_prometheus_metrics(export_port=8000):
     prometheus_client.start_http_server(export_port)
 
     # Create some basic metrics
-    metrics = {
+    metrics: dict[str, prometheus_client.Summary | prometheus_client.Counter] = {
         "function_duration": prometheus_client.Summary(
             "function_duration_seconds", "Time spent in functions", ["function"]
         ),
@@ -214,7 +215,7 @@ def setup_prometheus_metrics(export_port=8000):
 
 
 # Configure root logger
-def configure_root_logger(level=logging.INFO):
+def configure_root_logger(level: int = logging.INFO):
     """Configure the root logger with sensible defaults."""
     logging.basicConfig(
         level=level,

@@ -1,7 +1,6 @@
 # src/convorator/conversations/events.py
 from typing import TypedDict, Optional, Any, Dict, Callable, Union
 from enum import Enum  # Recommended for stages, payload_types, etc.
-from datetime import datetime  # For timestamp
 
 
 # --- Enums for controlled vocabularies ---

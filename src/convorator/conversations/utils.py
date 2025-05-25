@@ -1,6 +1,5 @@
 import inspect
 import json
-import logging
 import re
 from typing import Dict, Optional, Union, get_args, get_origin
 
@@ -10,12 +9,13 @@ from jsonschema.exceptions import ValidationError, SchemaError
 
 
 # Import exceptions from the central location
+from convorator.conversations.types import LoggerProtocol
 from convorator.exceptions import LLMResponseError, SchemaValidationError
 
 Schema = Dict[str, object]
 
 
-def validate_json(logger: logging.Logger, data: Dict[str, object], schema: Schema) -> None:
+def validate_json(logger: LoggerProtocol, data: Dict[str, object], schema: Schema) -> None:
     """
     Validate JSON data against a given schema.
 
@@ -45,7 +45,7 @@ def validate_json(logger: logging.Logger, data: Dict[str, object], schema: Schem
 
 
 def parse_json_response(
-    logger: logging.Logger,
+    logger: LoggerProtocol,
     response: str,
     context: str,
     schema: Optional[Dict[str, object]] = None,

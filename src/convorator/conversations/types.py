@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Protocol
+from typing import Any, Callable, Dict, Optional, Protocol, Union
 
 from convorator.client.llm_client import LLMInterface
 from convorator.conversations.state import MultiAgentConversation
@@ -32,7 +32,7 @@ class PromptBuilderInputs:
     topic: Optional[str] = None
     llm_group: Optional[SolutionLLMGroup] = None
     solution_schema: Optional[Dict[str, Any]] = None
-    initial_solution: Optional[str] = None
+    initial_solution: Optional[Union[Dict[str, object], str]] = None
     requirements: Optional[str] = None
     assessment_criteria: Optional[str] = None
     moderator_instructions: Optional[str] = None  # User-provided instructions

@@ -18,68 +18,83 @@ The orchestrator employs a multi-agent framework where each LLM plays a speciali
 
 The solution improvement process follows a structured workflow:
 
-1. Initial Setup: Configuration, loading LLMs, preparing initial inputs.
+1. Initial Setup: Configuration, loading LLMs, preparing initial inputs via `__init__` and `_prepare_prompt_inputs`.
 2. Moderated Debate: Multi-turn discussion between the Primary and Debater agents,
-   with the Moderator providing guidance and evaluation based on assessment criteria.
-3. Summary Synthesis: The Moderator consolidates insights and key feedback from the debate.
-4. Solution Generation: The Solution Generation Agent creates an improved solution incorporating the debate summary.
-5. Verification & Correction: The generated solution is validated against schema requirements.
-   If validation fails, the orchestrator attempts correction by feeding errors back to the Solution Generation Agent.
+   with the Moderator providing guidance and evaluation based on assessment criteria. Managed by `_run_moderated_debate`.
+3. Summary Synthesis: The Moderator consolidates insights and key feedback from the debate, managed by `_synthesize_summary`.
+4. Solution Generation: The Solution Generation Agent creates an improved solution incorporating the debate summary. Managed by `_generate_final_solution` which utilizes `_generate_and_verify_result`.
+5. Verification & Correction: The generated solution is validated against schema requirements (if any).
+   If validation fails, the orchestrator attempts correction by feeding errors back to the Solution Generation Agent within `_generate_and_verify_result`.
 
 Key Features:
 ------------
 1. Stateful Conversation Management:
-   - Maintains separate conversation contexts for each agent during the debate.
-   - Coordinates turns and ensures proper information flow between agents.
-   - Tracks the overall conversation history for context and logging.
+   - Maintains separate `Conversation` contexts for each agent (Primary, Debater, Moderator) during the debate.
+   - Coordinates turns and ensures proper information flow between agents during the debate.
+   - Tracks the overall conversation history in a `MultiAgentConversation` log for context and logging.
 
 2. Robust Error Handling & Verification:
-   - Schema validation for JSON outputs with descriptive error messages.
-   - Automatic retry loop for solution generation with intelligent error correction feedback.
-   - Token limit awareness and automatic history truncation to prevent API errors.
+   - Schema validation for JSON outputs using `parse_json_response`, with descriptive error messages.
+   - Automatic retry loop within `_generate_and_verify_result` for solution generation, providing intelligent error correction feedback to the LLM.
+   - Token limit awareness and automatic history truncation via `_prepare_history_for_llm` to prevent API errors.
 
 3. Configurable Orchestration:
-   - Customizable prompt generation logic via pluggable builder functions.
-   - Adjustable iteration counts for both the debate and the solution improvement/correction loop.
-   - Flexible LLM assignment to different roles.
+   - Customizable prompt generation logic via a pluggable `PromptBuilder` system.
+   - Adjustable iteration counts for both the debate (`debate_iterations`) and the solution improvement/correction loop (`improvement_iterations`).
+   - Flexible LLM assignment to different roles through `OrchestratorConfig` and `SolutionLLMGroup`.
 
 4. Schema-Driven Solution Refinement:
-   - Ensures final output adheres to a specified JSON schema (if provided).
-   - Focuses the improvement process on meeting structural and content requirements.
+   - Ensures final output adheres to a specified JSON schema (if `config.solution_schema` is provided).
+   - Focuses the improvement process on meeting structural and content requirements for JSON outputs.
+
+5. Event-Driven Messaging Callback System:
+   - Provides detailed event notifications via a `messaging_callback` function (if configured).
+   - Uses `EnhancedMessageMetadata` and specific `EventType`, `OrchestrationStage`, `MessageEntityType`,
+     and `MessagePayloadType` enums to describe events like prompts, responses, and errors.
+   - Facilitates observability, logging, and integration with external monitoring or data collection systems.
 
 Implementation Details:
 ---------------------
-The core of the system is the SolutionImprovementOrchestrator class, which:
+The core of the system is the `SolutionImprovementOrchestrator` class, which:
 
-1. Manages the multi-step workflow through its `run()` method.
-2. Coordinates the debate phase via `_run_moderated_debate()`.
-3. Handles individual agent turns using the `_execute_agent_turn()` helper.
-4. Generates and iteratively corrects the final solution via `_generate_and_verify_result()`.
+1. Manages the multi-step workflow through its `run()` method. This involves calling:
+   - `_prepare_prompt_inputs()` to set up data for prompt builders.
+   - `_run_moderated_debate()` to coordinate the debate phase.
+   - `_synthesize_summary()` to have the Moderator produce a debate summary.
+   - `_generate_final_solution()` to produce the final output.
+2. The debate phase (`_run_moderated_debate`) orchestrates turns:
+   - Agent turns within the debate loop are managed by `_execute_agent_loop_turn`.
+   - `_execute_agent_loop_turn` builds the appropriate prompt using `PromptBuilder` and then calls `_query_agent_in_debate_turn`.
+   - `_query_agent_in_debate_turn` handles adding messages to the respective agent's conversation log and the main log, then delegates to `_query_llm_core`.
+   - `_query_llm_core` is the central private method for LLM interaction. It prepares history (including truncation via `_prepare_history_for_llm`),
+     invokes messaging callbacks, and executes the LLM query.
+3. The final solution generation (`_generate_final_solution`) calls `_generate_and_verify_result`.
+   - `_generate_and_verify_result` iteratively prompts the Solution Generation LLM, validates the output (parsing, schema checks),
+     and retries with error feedback if necessary, using `_query_for_iterative_generation` (which also calls `_query_llm_core`).
 
-The orchestrator maintains conversation state separately for each agent involved in the
-debate, allowing them distinct perspectives while tracking the unified conversation flow.
-Error recovery in `_generate_and_verify_result()` is crucial, providing specific error
-details back to the Solution Generation Agent to guide the correction attempts.
+The orchestrator maintains separate `Conversation` states for each debating agent, allowing them distinct
+perspectives, while `MultiAgentConversation` tracks the unified conversation flow. Error recovery in
+`_generate_and_verify_result()` is crucial, providing specific error details back to the
+Solution Generation Agent to guide correction attempts.
 
 Usage:
 -----
 The primary entry point is the `improve_solution_with_moderation()` function, which accepts:
-- A configuration object (`OrchestratorConfig`) detailing LLMs, iterations, etc.
-- An initial solution (string or dictionary).
-- Requirements the final solution must meet.
-- Assessment criteria to guide the debate phase.
+- A configuration object (`OrchestratorConfig`) detailing LLMs, iterations, topic, initial solution, requirements, assessment criteria, schema, callback, etc.
+- Optionally, `initial_solution`, `requirements`, and `assessment_criteria` can be passed directly to override or supplement values in the `OrchestratorConfig`.
 
 Example:
 ```python
 from convorator.conversations.conversation_orchestrator import improve_solution_with_moderation
-from convorator.conversations.configurations import OrchestratorConfig
-from convorator.client.llm_client import LLMInterface
+from convorator.conversations.configurations import OrchestratorConfig, SolutionLLMGroup
+from convorator.client.llm_client import LLMInterface # Assuming LLMInterface is the base/actual class
+from convorator.conversations.prompts import PromptBuilder # If custom prompt builders are needed
 
-# 1. Configure LLMs for each role
-primary_llm = LLMInterface(...) # E.g., model tuned for generation
-debater_llm = LLMInterface(...) # E.g., model tuned for critique
-moderator_llm = LLMInterface(...) # E.g., model tuned for summarization/evaluation
-solution_llm = LLMInterface(...) # E.g., model tuned for final generation/correction
+# 1. Configure LLMs for each role (replace ... with actual LLM client instantiations)
+primary_llm = LLMInterface(...)
+debater_llm = LLMInterface(...)
+moderator_llm = LLMInterface(...)
+solution_llm = LLMInterface(...)
 
 # 2. Group LLMs
 llm_group = SolutionLLMGroup(
@@ -89,29 +104,44 @@ llm_group = SolutionLLMGroup(
     solution_generation_llm=solution_llm
 )
 
-# 3. Create Orchestrator Configuration
+# 3. Define the task inputs
+topic = "Improve Product Description for a New Smartwatch"
+initial_solution_dict = {'product_id': 'SW-001', 'name': 'Chronos', 'status': 'beta', 'description': 'A watch.'}
+requirements_str = "Final JSON: product_id (str), name (str), status ('active'|'discontinued'), description (str, <50 words, engaging), features (list of str)."
+assess_criteria_str = "Clarity of description, accuracy of status, completeness of features, adherence to requirements."
+json_schema = {
+    "type": "object",
+    "properties": {
+        "product_id": {"type": "string"},
+        "name": {"type": "string"},
+        "status": {"type": "string", "enum": ["active", "discontinued"]},
+        "description": {"type": "string", "maxLength": 250}, # Example: longer than 50 words for demo
+        "features": {"type": "array", "items": {"type": "string"}}
+    },
+    "required": ["product_id", "name", "status", "description", "features"]
+}
+
+# 4. Create Orchestrator Configuration
+# (PromptBuilder can be customized and passed if defaults are not sufficient)
 config = OrchestratorConfig(
     llm_group=llm_group,
-    topic="Improve Product Description",
-    requirements=requirements,
-    assessment_criteria=assessment_criteria,
-    debate_iterations=3,
-    improvement_iterations=2
-    # Add other configurations like custom prompt builders or schema if needed
+    topic=topic,
+    initial_solution=initial_solution_dict,
+    requirements=requirements_str,
+    assessment_criteria=assess_criteria_str,
+    solution_schema=json_schema, # Ensure output is validated JSON
+    expect_json_output=True,     # Critical if schema is provided
+    debate_iterations=2,
+    improvement_iterations=2,
+    # messaging_callback=my_custom_callback_function, # Optional
+    # prompt_builder=custom_prompt_builder_instance, # Optional
 )
-
-# 4. Define the task
-initial_solution = {'product_id': 123, 'status': 'draft'}
-requirements = "The final solution must be a JSON object containing 'product_id' (int), 'status' (string: 'active' or 'inactive'), and 'description' (string, max 100 chars)."
-assessment_criteria = "Focus on correctness of status and conciseness/relevance of description."
 
 # 5. Run the improvement process
 try:
     improved_solution = improve_solution_with_moderation(
-        config=config,
-        initial_solution=initial_solution,
-        requirements=requirements,
-        assessment_criteria=assessment_criteria
+        config=config
+        # Direct overrides for initial_solution, requirements, assessment_criteria are also possible here
     )
     print("Successfully generated improved solution:", improved_solution)
 except Exception as e:
@@ -121,13 +151,22 @@ except Exception as e:
 
 Dependencies:
 ------------
-- jsonschema: For JSON schema validation.
-- convorator.exceptions: For specialized exception types.
-- convorator.client.llm_client: For LLM communication and conversation management.
-- convorator.conversations.configurations: For orchestration configuration (`OrchestratorConfig`).
-- convorator.conversations.state: For conversation state management (`MultiAgentConversation`).
-- convorator.conversations.prompts: For default prompt builders and input structure (`PromptBuilderInputs`).
-- convorator.conversations.utils: For utility functions like JSON parsing (`parse_json_response`).
+Core:
+- `typing`: For type hinting.
+- `datetime`, `uuid` (from standard library): Used by the event messaging system.
+
+Internal `convorator` modules:
+- `convorator.exceptions`: For specialized exception types (`LLMOrchestrationError`, etc.).
+- `convorator.client.llm_client`: For LLM communication (`LLMInterface`, `Conversation`).
+- `convorator.conversations.configurations`: For orchestration configuration (`OrchestratorConfig`, `SolutionLLMGroup`).
+- `convorator.conversations.state`: For multi-agent conversation state (`MultiAgentConversation`).
+- `convorator.conversations.prompts`: For prompt construction (`PromptBuilderInputs`, `PromptBuilder`).
+- `convorator.conversations.utils`: For utility functions (e.g., `parse_json_response`).
+- `convorator.conversations.events`: For the event messaging system (`EnhancedMessageMetadata`, enums).
+- `convorator.utils.logger`: For structured logging.
+
+Third-party:
+- `jsonschema`: For JSON schema validation (used within `parse_json_response`).
 """
 
 from typing import Dict, List, Optional, Union, Any
@@ -302,10 +341,34 @@ class SolutionImprovementOrchestrator:
 
         # Initialize state variables
         self._reset_conversations()
-        self.current_iteration_num = 0
+        self.current_iteration_num = 0  # This will now use the property setter
         self.prompt_inputs: Optional[PromptBuilderInputs] = None
 
+    # Class level annotation for the instance variable that backs the property
+    _current_iteration_num: int
+
+    @property
+    def current_iteration_num(self) -> int:
+        """The current iteration number of a loop (e.g., debate round)."""
+        return self._current_iteration_num
+
+    @current_iteration_num.setter
+    def current_iteration_num(self, value: int) -> None:
+        self._current_iteration_num = value
+        if hasattr(self, "prompt_inputs") and self.prompt_inputs is not None:
+            self.prompt_inputs.current_iteration_num = value
+
     def _reset_conversations(self) -> None:
+        """
+        Initializes or resets all conversation state variables.
+
+        This method sets up fresh `Conversation` objects for the primary, debater,
+        and moderator agents, using their respective system messages. It also
+        initializes an empty `MultiAgentConversation` log to track the overall
+        dialogue and a dictionary to map agent role names to their dedicated
+        conversation objects. This is typically called during orchestrator
+        initialization or if a full reset of the conversation state is required.
+        """
         self.primary_conv = Conversation(system_message=self.primary_llm.get_system_message())
         self.debater_conv = Conversation(system_message=self.debater_llm.get_system_message())
         self.moderator_conv = Conversation(system_message=self.moderator_llm.get_system_message())
@@ -326,7 +389,8 @@ class SolutionImprovementOrchestrator:
 
         Raises:
             Exceptions propagated from internal steps (e.g., LLMResponseError,
-            SchemaValidationError, LLMOrchestrationError).
+            SchemaValidationError, LLMOrchestrationError, MaxIterationsExceededError,
+            LLMClientError).
         """
         self.logger.info("Starting orchestrated solution improvement workflow.")
         try:
@@ -356,6 +420,7 @@ class SolutionImprovementOrchestrator:
                     SchemaValidationError,
                     LLMOrchestrationError,
                     MaxIterationsExceededError,
+                    LLMClientError,
                 ),
             ):
                 raise
@@ -401,7 +466,8 @@ class SolutionImprovementOrchestrator:
             The complete debate history log.
         """
         self.logger.info(f"Conducting moderated debate for {self.debate_iterations} iterations.")
-        if not self.prompt_builder.is_inputs_defined():
+
+        if (self.prompt_inputs is None) or (not self.prompt_builder.is_inputs_defined()):
             raise LLMOrchestrationError("Prompt inputs not prepared before running debate.")
 
         # --- Initial User Prompt Setup ---
@@ -424,7 +490,8 @@ class SolutionImprovementOrchestrator:
             # --- Main Debate Rounds Loop ---
             for i in range(self.debate_iterations):
                 round_num = i + 1
-                self.prompt_inputs.current_iteration_num = round_num
+                # Update current_iteration_num through the property, which will sync prompt_inputs
+                self.current_iteration_num = round_num
                 self.logger.info(f"Starting Round {round_num}/{self.debate_iterations}.")
 
                 # Primary Turn
@@ -482,6 +549,8 @@ class SolutionImprovementOrchestrator:
             build_prompt = "debater_prompt"
         elif agent_name == self.moderator_name:
             build_prompt = "moderator_context"
+        else:
+            raise LLMOrchestrationError(f"Unknown agent name: {agent_name}")
 
         response = self._query_agent_in_debate_turn(
             self.llm_dict[agent_name],
@@ -557,18 +626,30 @@ class SolutionImprovementOrchestrator:
         context: str = "LLM Query",
     ) -> List[Dict[str, str]]:
         """
-        Prepares a list of messages for an LLM call, ensuring it fits within the context limit.
+        Prepares and potentially truncates a list of messages for an LLM call.
+
+        This method ensures that the total number of tokens in the message history,
+        including any system message and a buffer for the LLM's response, does not
+        exceed the LLM's context limit. If the history is too long, it removes
+        the oldest messages (excluding the system message, if present) until
+        the history fits within the allowed token limit.
 
         Args:
-            llm_service: The LLMInterface instance being used.
-            messages: The list of messages (dictionaries) intended for the LLM.
-            context: A string describing the context for logging purposes.
+            llm_service: The `LLMInterface` instance being used for the upcoming call.
+                         This is used to access token counting methods and context limits.
+            messages: The list of message dictionaries (each with 'role' and 'content')
+                      to be sent to the LLM.
+            context: A descriptive string for logging purposes, indicating the operational
+                     context of this history preparation (e.g., "Primary Agent Turn").
 
         Returns:
-            The potentially truncated list of messages ready for the API call.
+            A list of message dictionaries, potentially truncated, ready for the API call.
 
         Raises:
-            LLMOrchestrationError: If token counting fails unexpectedly.
+            LLMOrchestrationError: If the system message alone (plus buffer) exceeds
+                                   the token limit, or if truncation fails to reduce
+                                   the history to a valid size. Also raised for
+                                   unexpected errors during token counting.
         """
         try:
             max_limit = llm_service.get_context_limit()
@@ -670,36 +751,50 @@ class SolutionImprovementOrchestrator:
         This method encapsulates the fundamental sequence of operations for an LLM call:
         1. Prepares the message history using `_prepare_history_for_llm` (handles token limits).
         2. Invokes the `messaging_callback` with detailed metadata before sending the prompt.
-        3. Executes the `llm_service.query()` call.
+        3. Executes the `llm_service.query()` call using the prepared messages.
         4. Invokes the `messaging_callback` with detailed metadata after receiving the response.
         5. Returns the raw response content from the LLM.
 
         This method does NOT:
         - Manage `Conversation` objects directly (e.g., adding messages to them).
         - Update the main conversation log (`self.main_conversation_log`) or agent-specific logs (`self.role_conversation`).
-        - Implement retry logic (errors from LLM or history preparation are propagated).
+        - Implement retry logic; errors from LLM interaction or history preparation are propagated.
 
         Args:
-            llm_service: The LLMInterface instance to query.
-            messages_to_send_raw: The complete list of messages (system, user, assistant roles)
-                                  to be potentially sent to the LLM, prior to truncation.
-            current_prompt_text_for_callback: The specific text of the current prompt message being sent.
-                                            This is used for the 'content' field in the prompt callback.
-            stage: The high-level operational stage (e.g., DEBATE_TURN) for metadata.
-            step_description: A detailed description of the current step for metadata (e.g., "Primary Agent Round 1").
-            iteration_num: Optional iteration number (e.g., debate round, improvement attempt) for metadata.
-            prompt_source_entity_type: The type of entity initiating the prompt (for prompt metadata).
-            prompt_source_entity_name: The name of the entity initiating the prompt (for prompt metadata).
-            prompt_metadata_data: Optional additional structured data for the prompt's metadata 'data' field.
-            query_kwargs: Optional additional arguments to pass to `llm_service.query()`.
+            llm_service: The `LLMInterface` instance to query.
+            messages_to_send_raw: The complete list of messages (potentially including system,
+                                  user, and assistant roles) that will be processed by
+                                  `_prepare_history_for_llm` before being sent to the LLM.
+            current_prompt_text_for_callback: The specific text of the current prompt message
+                                            being sent. This is used for the 'content' field
+                                            in the `messaging_callback` for the prompt event.
+            stage: The high-level operational stage (e.g., `OrchestrationStage.DEBATE_TURN`)
+                   for creating `EnhancedMessageMetadata` for callbacks.
+            step_description: A detailed human-readable description of the current step
+                              (e.g., "Primary Agent Round 1 Response") for metadata.
+            iteration_num: Optional iteration number (e.g., debate round number,
+                           solution improvement attempt number) for metadata.
+            prompt_source_entity_type: The type of entity initiating the prompt (e.g.,
+                                       `MessageEntityType.USER_PROMPT_SOURCE`) for prompt metadata.
+            prompt_source_entity_name: The name of the entity initiating the prompt (e.g., "user",
+                                       or an agent role name if one agent is prompting another
+                                       through the orchestrator) for prompt metadata.
+            prompt_metadata_data: Optional additional structured data to be included in the
+                                  `EnhancedMessageMetadata.data` field for the prompt event callback.
+            query_kwargs: Optional dictionary of additional keyword arguments to pass to
+                          `llm_service.query()` (e.g., specific model parameters not
+                          covered by default settings like temperature or max_tokens).
 
         Returns:
             The string content of the LLM's response.
 
         Raises:
-            LLMOrchestrationError: If `_prepare_history_for_llm` fails (e.g., token limit issues).
-            LLMResponseError: If `llm_service.query()` fails due to issues with the LLM's response.
-            LLMClientError: If `llm_service.query()` fails due to client-side issues (e.g., network, auth).
+            LLMOrchestrationError: If `_prepare_history_for_llm` fails (e.g., due to token
+                                   limit issues that cannot be resolved by truncation).
+            LLMResponseError: If `llm_service.query()` fails due to issues with the LLM's
+                              response (e.g., API errors, rate limits, content filtering).
+            LLMClientError: If `llm_service.query()` fails due to client-side issues
+                            (e.g., network problems, authentication failures).
         """
         self.logger.debug(
             f"_query_llm_core: Stage='{stage.value}', Step='{step_description}', LLM='{llm_service.get_role_name() or 'UnnamedLLM'}'"
@@ -820,34 +915,53 @@ class SolutionImprovementOrchestrator:
         add_prompt_to_main_log: bool = True,
     ) -> str:
         """
-        Queries an LLM agent, updates its perspective history, the main log,
-        and optionally other agents' histories. This version delegates the core LLM
-        interaction to _query_llm_core for better code reuse and standardized handling.
+        Queries an LLM agent during a debate turn, updating relevant conversation logs.
+
+        This method orchestrates a single agent's turn within the debate. It performs
+        the following steps:
+        1. Validates that the prompt is not empty and that the agent's conversation
+           history is in a valid state (last message is not from 'user').
+        2. Adds the provided `prompt` as a user message to the specified agent's
+           dedicated `Conversation` object (`self.role_conversation[queried_role_name]`).
+        3. Optionally adds the `prompt` to the main multi-agent conversation log
+           (`self.main_conversation_log`).
+        4. Invokes `_query_llm_core` to execute the actual LLM call, passing the
+           agent's updated conversation history and relevant metadata.
+        5. Adds the LLM's response as an assistant message to the agent's dedicated
+           `Conversation` object.
+        6. Adds the LLM's response to the `main_conversation_log`, attributed to the
+           `queried_role_name`.
 
         Args:
-            llm_to_query: The LLMInterface instance to query.
-            queried_role_name: The specific role name for logging.
-            prompt: The prompt to send to the LLM.
-            query_kwargs: Optional additional arguments for the LLM query.
-            add_prompt_to_main_log: Whether to add the prompt to the main log.
+            llm_to_query: The `LLMInterface` instance for the agent to be queried.
+            queried_role_name: The role name (e.g., "Primary", "Debater") of the agent
+                               executing this turn. This is used for logging and to
+                               access the correct conversation history.
+            prompt: The prompt content to be sent to the LLM agent.
+            query_kwargs: Optional dictionary of additional keyword arguments to pass to
+                          the `_query_llm_core` method, and subsequently to the
+                          `llm_service.query()` call.
+            add_prompt_to_main_log: If True (default), the `prompt` is added as a 'user'
+                                    message to the `main_conversation_log` before the
+                                    LLM call. Set to False if the prompt source is not
+                                    conceptually a user input to the main debate flow.
 
         Returns:
-            The content of the LLM response.
+            The string content of the LLM agent's response.
 
         Raises:
-            LLMOrchestrationError: For validation issues or token counting failures.
-            LLMResponseError: If the LLM query fails.
-            LLMClientError: For client-side errors during LLM interaction.
+            LLMOrchestrationError: If prompt validation fails, or if there are unexpected
+                                   errors during the query or logging process.
+            LLMResponseError: Propagated from `_query_llm_core` if the LLM query fails
+                              due to issues with the LLM's response.
+            LLMClientError: Propagated from `_query_llm_core` for client-side errors
+                            during LLM interaction (e.g., network, authentication).
         """
         try:
             self.logger.info(f"Try to query {queried_role_name}...")
 
             # 1. Validations - these remain the same as in _query_agent
             conversation_history = self.role_conversation[queried_role_name]
-            if not isinstance(conversation_history, (Conversation, MultiAgentConversation)):
-                raise LLMOrchestrationError(
-                    f"{queried_role_name}'s conversation history must be a Conversation or MultiAgentConversation"
-                )
 
             if prompt == "":
                 raise LLMOrchestrationError(f"Prompt cannot be empty.")
@@ -870,7 +984,7 @@ class SolutionImprovementOrchestrator:
                 current_prompt_text_for_callback=prompt,
                 stage=OrchestrationStage.DEBATE_TURN,
                 step_description=f"{queried_role_name} Agent Response",
-                iteration_num=self.prompt_inputs.current_iteration_num,
+                iteration_num=self.current_iteration_num,
                 prompt_source_entity_type=MessageEntityType.USER_PROMPT_SOURCE,
                 prompt_source_entity_name="user",
                 prompt_metadata_data=None,
@@ -889,7 +1003,11 @@ class SolutionImprovementOrchestrator:
 
             return response_content
 
-        except LLMResponseError as e:
+        except (LLMResponseError, LLMClientError) as e:
+            self.logger.error(f"{queried_role_name} query failed: {e}", exc_info=True)
+            raise
+        except LLMOrchestrationError as e:
+            # Don't wrap LLMOrchestrationError, just propagate
             self.logger.error(f"{queried_role_name} query failed: {e}", exc_info=True)
             raise
         except Exception as e:
@@ -914,32 +1032,64 @@ class SolutionImprovementOrchestrator:
         query_kwargs: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Handles LLM querying specifically for the iterative generation loop
-        in _generate_and_verify_result, using _query_llm_core.
+        Handles LLM querying for iterative generation and correction loops.
 
-        This method prepares messages for stateless or stateful (via generation_conversation_obj)
-        calls and invokes _query_llm_core with appropriate metadata for the generation/fix stage.
+        This method is a specialized wrapper around `_query_llm_core` tailored for
+        the iterative process of generating a solution and then attempting to fix it
+        if errors occur. It manages message preparation for either stateful (using
+        a dedicated `Conversation` object) or stateless LLM calls.
+
+        Key steps:
+        1. If a `generation_conversation_obj` is provided (stateful mode), adds the
+           `current_prompt_content` as a user message to it and prepares the full
+           history from this object.
+        2. If `generation_conversation_obj` is None (stateless mode), constructs a new
+           message list containing the LLM's system message (if any) and the
+           `current_prompt_content` as a user message.
+        3. Calls `_query_llm_core` with these messages, the `current_prompt_content`
+           (for callback purposes), and specific metadata including the `stage`
+           (e.g., `SOLUTION_GENERATION_INITIAL` or `SOLUTION_GENERATION_FIX_ATTEMPT`),
+           `base_context_for_logging`, and `attempt_num`.
+        4. If in stateful mode, adds the LLM's response as an assistant message to the
+           `generation_conversation_obj`.
+        5. Returns the raw LLM response content.
 
         Args:
-            llm_service: The LLMInterface to use for the query.
-            current_prompt_content: The actual prompt string for the current attempt.
-            generation_conversation_obj: Optional Conversation object for maintaining state across attempts.
-                                       If None, the call is treated as stateless.
-            base_context_for_logging: The base context string for logging (e.g., "Final Solution Generation").
-            attempt_num: The current attempt number in the iterative loop.
-            stage: The specific OrchestrationStage for this attempt (e.g., INITIAL_ATTEMPT, FIX_ATTEMPT).
-            prompt_metadata_for_llm_core: Optional additional structured data to be included in the
-                                          'data' field of the prompt's EnhancedMessageMetadata via _query_llm_core.
-            query_kwargs: Optional dictionary of keyword arguments for the LLM's query method.
+            llm_service: The `LLMInterface` instance to use for the query.
+            current_prompt_content: The actual prompt string for the current generation
+                                    or correction attempt.
+            generation_conversation_obj: Optional `Conversation` object. If provided,
+                                       this conversation's history is used and updated,
+                                       allowing the LLM to maintain context across
+                                       multiple generation/fix attempts. If None, each
+                                       call is stateless from the LLM's perspective.
+            base_context_for_logging: A string describing the broader context of this
+                                      iterative generation (e.g., "Final Solution Generation").
+                                      Used for logging and metadata.
+            attempt_num: The current attempt number within the iterative loop (e.g., 1
+                         for initial attempt, 2 for first fix attempt).
+            stage: The specific `OrchestrationStage` for this attempt (e.g.,
+                   `OrchestrationStage.SOLUTION_GENERATION_INITIAL_ATTEMPT` or
+                   `OrchestrationStage.SOLUTION_GENERATION_FIX_ATTEMPT`).
+            prompt_metadata_for_llm_core: Optional additional structured data to be passed
+                                          to `_query_llm_core` and included in the
+                                          `EnhancedMessageMetadata.data` field for the
+                                          prompt event callback. Useful for passing, e.g.,
+                                          error details during fix attempts.
+            query_kwargs: Optional dictionary of keyword arguments to pass to the
+                          `llm_service.query()` method via `_query_llm_core`.
 
         Returns:
             The raw string content of the LLM's response.
 
         Raises:
-            Propagates exceptions from _query_llm_core (e.g., LLMResponseError, LLMClientError, LLMOrchestrationError).
+            Propagates exceptions from `_query_llm_core`, which include:
+            - `LLMOrchestrationError`: For history preparation failures.
+            - `LLMResponseError`: For LLM API errors or problematic responses.
+            - `LLMClientError`: For client-side LLM interaction issues.
         """
         self.logger.debug(
-            f"_query_for_iterative_generation: BaseContext='{base_context_for_logging}', Attempt={attempt_num}, Stage='{stage.value}"
+            f"_query_for_iterative_generation: BaseContext='{base_context_for_logging}', Attempt={attempt_num}, Stage='{stage.value}'"
         )
 
         messages_to_send_raw: List[Dict[str, str]]
@@ -987,30 +1137,56 @@ class SolutionImprovementOrchestrator:
         json_result: bool = True,
     ) -> Union[Dict[str, object], str]:
         """
-        Generates a result using an LLM, verifies it (parsing, schema validation),
-        and attempts to fix errors iteratively up to a maximum number of attempts.
-        This version leverages other internal methods for history preparation and prompt building.
+        Generates, verifies, and iteratively corrects a result using an LLM.
+
+        This method implements a loop to produce a result that meets specified
+        criteria (e.g., parsing as JSON, validating against a schema). It first
+        prompts the LLM for an initial result. If `json_result` is True, it attempts
+        to parse the response as JSON and, if `result_schema` is provided, validates
+        it against the schema. If any of these steps fail, or if an `LLMResponseError`
+        or `LLMOrchestrationError` occurs during generation, it captures the error,
+        constructs a "fix prompt" (including the error and the faulty response),
+        and re-queries the LLM. This process repeats up to `max_improvement_iterations`.
+
+        The method can operate in two modes regarding conversation history for this loop:
+        - Stateful (`use_conversation=True`): A dedicated `Conversation` object is
+          maintained for this generation task. The LLM sees the history of its previous
+          attempts and the corresponding fix prompts, allowing it to learn from errors.
+        - Stateless (`use_conversation=False`): Each attempt is made with a fresh context,
+          though the fix prompt still provides error details from the last attempt.
 
         Args:
-            llm_service: LLM interface to use.
-            context: Logging context string (e.g., "Final Solution Generation").
-            result_schema: Optional JSON schema for validation if json_result is True.
-            use_conversation: If True, maintains a separate Conversation object for this
-                              generation task, allowing the LLM to build on its previous
-                              attempts within this specific generation loop. If False,
-                              each attempt is more stateless from the LLM's perspective,
-                              though error context is still provided in the prompt.
-            max_improvement_iterations: Max attempts to generate and fix errors.
-            json_result: Whether the expected result is JSON.
+            llm_service: The `LLMInterface` instance to use for generating the result.
+            context: A descriptive string for logging and metadata, indicating the purpose
+                     of this generation task (e.g., "Final Solution Generation").
+            result_schema: Optional JSON schema (as a dictionary) to validate against if
+                           `json_result` is True. If None, only JSON parsing is checked.
+            use_conversation: If True (default), a dedicated `Conversation` object is used
+                              to maintain state across iterative attempts within this method.
+                              If False, each attempt is more stateless for the LLM.
+            max_improvement_iterations: The maximum number of attempts (including the initial
+                                      one) to generate and correct the result.
+            json_result: If True (default), the expected result is a JSON object. The method
+                         will attempt to parse the LLM response as JSON and validate against
+                         `result_schema` if provided. If False, the raw string response is
+                         returned after the first successful generation.
 
         Returns:
-            The verified result (Dict if JSON, otherwise str).
+            The verified result. This will be a dictionary if `json_result` is True and
+            parsing/validation succeeds, otherwise it's the raw string response from the LLM
+            (if `json_result` is False and generation succeeds).
 
         Raises:
-            MaxIterationsExceededError: If max iterations are reached without success.
-            SchemaValidationError: If JSON validation fails after retries (and json_result is True).
-            LLMResponseError: If an LLM query fails.
-            LLMOrchestrationError: For other orchestration issues (e.g., prompt building failure, token limit issues).
+            MaxIterationsExceededError: If a valid result cannot be produced within
+                                      `max_improvement_iterations`.
+            SchemaValidationError: If `json_result` is True and the final successfully parsed
+                                   JSON response fails schema validation (and no more retries).
+                                   This is typically the error from the last attempt.
+            LLMResponseError: If an LLM query fails irrecoverably (e.g., client error not
+                              related to content, or an error occurs on the last attempt).
+            LLMOrchestrationError: For other orchestration issues, such as failure to prepare
+                                   prompt inputs, or if a fix prompt cannot be built.
+            LLMClientError: If a non-recoverable LLM client error occurs during generation.
         """
         self.logger.info(
             f"Generating result for context: '{context}'. Max iterations: {max_improvement_iterations}. Expect JSON: {json_result}."
@@ -1037,7 +1213,7 @@ class SolutionImprovementOrchestrator:
 
         # Initial prompt for the first attempt
         current_prompt_content = self.prompt_builder.build_prompt("improvement_prompt")
-
+        current_stage: OrchestrationStage = OrchestrationStage.SOLUTION_GENERATION_INITIAL
         for attempt in range(1, max_improvement_iterations + 1):
             self.logger.info(
                 f"Context '{context}': Generating result (Attempt {attempt}/{max_improvement_iterations})"
@@ -1045,7 +1221,6 @@ class SolutionImprovementOrchestrator:
             raw_response_for_fix_prompt: Optional[str] = (
                 None  # Store the raw response for the fix prompt
             )
-            current_stage: OrchestrationStage.SOLUTION_GENERATION_INITIAL_ATTEMPT
             prompt_data_for_callback: Optional[Dict[str, Any]] = None
 
             if attempt > 1:
