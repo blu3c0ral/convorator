@@ -362,10 +362,11 @@ class LLMInterface(ABC):
         Returns:
             True if the setting was successfully changed, False if not supported.
         """
-        if setting_name == "temperature" and hasattr(self, "temperature"):
-            self.temperature = value
-            return True
-        elif setting_name == "max_tokens":
+        # NOTE: Temperature validation is intentionally NOT handled here.
+        # Each provider should implement its own temperature validation
+        # in their override of this method to ensure proper bounds checking.
+
+        if setting_name == "max_tokens":
             self.max_tokens = value
             return True
         elif setting_name == "system_message":
@@ -470,9 +471,18 @@ class LLMInterface(ABC):
                     if self._system_message:
                         messages_to_send.append({"role": "system", "content": self._system_message})
 
-                # Add the current user prompt
-                messages_to_send.append({"role": "user", "content": prompt})
-                logger.debug(f"Performing stateless query with {len(messages_to_send)} messages.")
+                # Add the current user prompt - but only if it's not empty/whitespace
+                # This handles the orchestrator pattern where prompt="" and the actual prompt
+                # is already included in the provided conversation_history
+                if prompt and prompt.strip():
+                    messages_to_send.append({"role": "user", "content": prompt})
+                    logger.debug(
+                        f"Performing stateless query with {len(messages_to_send)} messages (prompt appended)."
+                    )
+                else:
+                    logger.debug(
+                        f"Performing stateless query with {len(messages_to_send)} messages (empty prompt not appended)."
+                    )
 
             # --- API Call (Common for both stateful/stateless) ---
             response_content = self._call_api(messages_to_send)

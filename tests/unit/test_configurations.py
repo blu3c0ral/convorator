@@ -81,10 +81,6 @@ def test_orchestrator_config_validation_errors(valid_config_params):
     with pytest.raises(ValueError, match="improvement_iterations must be at least 1"):
         OrchestratorConfig(**valid_config_params, improvement_iterations=0)
 
-    # Test invalid llm_group type
-    with pytest.raises(TypeError, match="llm_group must be an instance of SolutionLLMGroup"):
-        OrchestratorConfig(**{**valid_config_params, "llm_group": "not a SolutionLLMGroup"})
-
     # Test missing topic
     with pytest.raises(ValueError, match="Configuration requires a 'topic'"):
         OrchestratorConfig(**{**valid_config_params, "topic": ""})
@@ -107,29 +103,16 @@ def test_orchestrator_config_logger(valid_config_params):
     mock_logger.info.assert_called_once_with("OrchestratorConfig initialized and validated.")
 
 
-def test_orchestrator_config_custom_prompt_builders(valid_config_params):
-    """Test that custom prompt builder functions can be provided."""
-    mock_prompt_builder = MagicMock(return_value="Custom prompt")
+def test_orchestrator_config_custom_prompt_builder(valid_config_params):
+    """Test that custom prompt builder can be provided."""
+    from convorator.conversations.prompts import PromptBuilder
+
+    # Create a custom prompt builder
+    custom_prompt_builder = PromptBuilder()
 
     config = OrchestratorConfig(
         **valid_config_params,
-        build_initial_prompt=mock_prompt_builder,
-        build_debate_user_prompt=mock_prompt_builder,
-        build_moderator_context=mock_prompt_builder,
-        build_moderator_role_instructions=mock_prompt_builder,
-        build_primary_prompt=mock_prompt_builder,
-        build_debater_prompt=mock_prompt_builder,
-        build_summary_prompt=mock_prompt_builder,
-        build_improvement_prompt=mock_prompt_builder,
-        build_fix_prompt=mock_prompt_builder,
+        prompt_builder=custom_prompt_builder,
     )
 
-    assert config.build_initial_prompt == mock_prompt_builder
-    assert config.build_debate_user_prompt == mock_prompt_builder
-    assert config.build_moderator_context == mock_prompt_builder
-    assert config.build_moderator_role_instructions == mock_prompt_builder
-    assert config.build_primary_prompt == mock_prompt_builder
-    assert config.build_debater_prompt == mock_prompt_builder
-    assert config.build_summary_prompt == mock_prompt_builder
-    assert config.build_improvement_prompt == mock_prompt_builder
-    assert config.build_fix_prompt == mock_prompt_builder
+    assert config.prompt_builder == custom_prompt_builder

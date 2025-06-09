@@ -402,6 +402,12 @@ class OpenAILLM(LLMInterface):
     def _get_tiktoken_encoding(self):
         """Lazily loads and returns the tiktoken encoding for the current model."""
         if self._encoding is None:
+            # First, check if the tiktoken library was imported successfully.
+            # No warning here; the public `count_tokens` method will issue the warning.
+            if not tiktoken:
+                self._encoding = "FAILED_TO_LOAD"
+                return None
+
             encoding_name = self.MODEL_TO_ENCODING.get(self._model, self.DEFAULT_ENCODING)
             if encoding_name != self.DEFAULT_ENCODING and self._model not in self.MODEL_TO_ENCODING:
                 self.logger.warning(
@@ -702,7 +708,6 @@ class OpenAILLM(LLMInterface):
     def count_tokens(self, text: str) -> int:
         """Counts the number of tokens using tiktoken for the configured model."""
         encoding = self._get_tiktoken_encoding()
-        fallback_reason = None
 
         if encoding:
             try:
@@ -711,33 +716,19 @@ class OpenAILLM(LLMInterface):
                     f"Counted {num_tokens} tokens for text (length {len(text)}) using {encoding.name}."
                 )
                 return num_tokens
-            except ImportError as e:  # Should be caught by _get_tiktoken_encoding, but defensive
-                self.logger.error(
-                    f"Tiktoken library not found, though encoding object was present: {e}"
-                )
-                fallback_reason = "Tiktoken library import failed"
-            except ValueError as e:  # tiktoken.get_encoding can raise this for bad encoding names
-                self.logger.error(f"Invalid tiktoken encoding name used: {e}")
-                fallback_reason = f"Invalid tiktoken encoding: {e}"
             except Exception as e:
-                self.logger.error(
-                    f"Error using tiktoken encoding '{encoding.name}' to count tokens: {e}"
-                )
                 fallback_reason = f"tiktoken encoding error ({encoding.name}): {e}"
-        elif (
-            self._encoding == "FAILED_TO_LOAD"
-        ):  # Check specific marker from _get_tiktoken_encoding
-            self.logger.warning("Tiktoken encoding failed to load previously.")
-            fallback_reason = "tiktoken encoding failed to load"
-        else:  # Tiktoken not installed or not found for model and no specific load failure
-            self.logger.warning("Tiktoken library not available or no encoding found for model.")
-            fallback_reason = "tiktoken not available or no model encoding"
+                self.logger.error(
+                    f"Error using tiktoken encoding to count tokens: {e}", exc_info=True
+                )
+        else:
+            fallback_reason = "tiktoken library not available or encoding failed to load"
 
         # Fallback approximation
         estimated_tokens = len(text) // 4
         self.logger.warning(
             f"Using approximate token count ({estimated_tokens}) due to: {fallback_reason}. "
-            f"Install 'tiktoken' and ensure correct model/encoding names for accuracy."
+            f"For accurate counts, ensure 'tiktoken' is installed and the model name is correct."
         )
         return estimated_tokens
 
@@ -800,10 +791,10 @@ class OpenAILLM(LLMInterface):
         return base_settings
 
     def set_provider_setting(self, setting_name: str, value: Any) -> bool:
-        """Sets OpenAI-specific settings."""
-        if super().set_provider_setting(setting_name, value):
-            return True
-
+        """
+        Sets OpenAI-specific settings and overrides base settings where applicable.
+        """
+        # Handle OpenAI-specific settings first
         if setting_name == "temperature":
             if isinstance(value, (int, float)) and 0 <= value <= 2:
                 self.temperature = float(value)
@@ -812,7 +803,8 @@ class OpenAILLM(LLMInterface):
             else:
                 self.logger.warning(f"Invalid temperature value: {value}. Must be between 0 and 2.")
                 return False
-        elif setting_name == "use_responses_api":
+
+        if setting_name == "use_responses_api":
             if isinstance(value, bool):
                 old_value = self.use_responses_api
                 self.use_responses_api = value
@@ -827,7 +819,8 @@ class OpenAILLM(LLMInterface):
                 self.logger.warning(f"Invalid use_responses_api value: {value}. Must be boolean.")
                 return False
 
-        return False
+        # If not an OpenAI-specific setting, delegate to the base class
+        return super().set_provider_setting(setting_name, value)
 
     def supports_feature(self, feature_name: str) -> bool:
         """Checks OpenAI-specific feature support."""

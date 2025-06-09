@@ -17,8 +17,8 @@ from convorator.conversations.prompts import (
     default_build_summary_prompt,
     default_build_improvement_prompt,
     default_build_fix_prompt,
-    _get_last_message_content_by_role,
-    _get_nth_last_message_content_by_role,
+    get_last_message_content_by_role,
+    get_nth_last_message_content_by_role,
 )
 from convorator.conversations.state import MultiAgentConversation
 from convorator.client.llm_client import LLMInterface
@@ -279,34 +279,34 @@ def test_fix_prompt_no_json(basic_prompt_inputs):
 
 
 def test_get_last_message_content_by_role():
-    """Tests the _get_last_message_content_by_role helper function."""
+    """Tests the get_last_message_content_by_role helper function."""
     history = MultiAgentConversation()
     logger = Mock()
 
     # Empty history
-    assert _get_last_message_content_by_role(history, "SomeRole", logger) is None
+    assert get_last_message_content_by_role(history, "SomeRole", logger) is None
 
     # History with one message
     history.add_message("TestRole", "Test message")
-    assert _get_last_message_content_by_role(history, "TestRole", logger) == "Test message"
-    assert _get_last_message_content_by_role(history, "NonexistentRole", logger) is None
+    assert get_last_message_content_by_role(history, "TestRole", logger) == "Test message"
+    assert get_last_message_content_by_role(history, "NonexistentRole", logger) is None
 
     # History with multiple messages from same role
     history.add_message("TestRole", "Second message")
-    assert _get_last_message_content_by_role(history, "TestRole", logger) == "Second message"
+    assert get_last_message_content_by_role(history, "TestRole", logger) == "Second message"
 
     # Check None history handling
-    assert _get_last_message_content_by_role(None, "TestRole", logger) is None
+    assert get_last_message_content_by_role(None, "TestRole", logger) is None
     logger.warning.assert_called()
 
 
 def test_get_nth_last_message_content_by_role():
-    """Tests the _get_nth_last_message_content_by_role helper function."""
+    """Tests the get_nth_last_message_content_by_role helper function."""
     history = MultiAgentConversation()
     logger = Mock()
 
     # Empty history
-    assert _get_nth_last_message_content_by_role(history, "SomeRole", 1, logger) is None
+    assert get_nth_last_message_content_by_role(history, "SomeRole", 1, logger) is None
 
     # Add multiple messages from same role
     history.add_message("TestRole", "First message")
@@ -314,18 +314,18 @@ def test_get_nth_last_message_content_by_role():
     history.add_message("TestRole", "Third message")
 
     # Test retrieving different positions
-    assert _get_nth_last_message_content_by_role(history, "TestRole", 1, logger) == "Third message"
-    assert _get_nth_last_message_content_by_role(history, "TestRole", 2, logger) == "Second message"
-    assert _get_nth_last_message_content_by_role(history, "TestRole", 3, logger) == "First message"
+    assert get_nth_last_message_content_by_role(history, "TestRole", 1, logger) == "Third message"
+    assert get_nth_last_message_content_by_role(history, "TestRole", 2, logger) == "Second message"
+    assert get_nth_last_message_content_by_role(history, "TestRole", 3, logger) == "First message"
 
     # Out of range
-    assert _get_nth_last_message_content_by_role(history, "TestRole", 4, logger) is None
+    assert get_nth_last_message_content_by_role(history, "TestRole", 4, logger) is None
 
     # Nonexistent role
-    assert _get_nth_last_message_content_by_role(history, "NonexistentRole", 1, logger) is None
+    assert get_nth_last_message_content_by_role(history, "NonexistentRole", 1, logger) is None
 
     # Check None history handling
-    assert _get_nth_last_message_content_by_role(None, "TestRole", 1, logger) is None
+    assert get_nth_last_message_content_by_role(None, "TestRole", 1, logger) is None
     logger.warning.assert_called()
 
 
